@@ -24,7 +24,7 @@ def log_view(parent,*,height=8,expanded=False):
     return view
 
 
-def build(app):
+def build(app,operations_class):
     root=app.root
     root.title('HWADAM · 화담숲 예약 모니터')
     app.brand_images=load_branding(root)
@@ -220,8 +220,7 @@ def build(app):
         ttk.Label(row,text=title,style='Card.TLabel').pack(side='left',padx=(0,8));app._entry(row,key,width=7).pack(side='left',padx=(0,22))
     ttk.Label(advanced.content,text='반복 알림 0초: 첫 발견·재등장·재고 증가 등 변화가 있을 때만 알림',style='Muted.Card.TLabel').pack(anchor='w',pady=(0,12))
     ttk.Label(advanced.content,text='선택 상품 주소',style='Muted.Card.TLabel').pack(anchor='w');app._entry(advanced.content,'product_url').pack(fill='x',pady=(4,0))
-    from ui_operations import OperationsUI
-    app.operations=OperationsUI(app)
+    app.operations=operations_class(app)
     for widget,tone in ((modecard,'Cream'),(app.addon_card,'Amber'),(datecard,'Sage'),
                         (timecard,'Mint'),(monocard,'Amber'),(target,'Cream'),
                         (resultcard,'Mint'),(statuscard,'Night'),(logcard,'Night'),

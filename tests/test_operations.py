@@ -25,7 +25,7 @@ class OperationsGuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
             try:
-                with patch('ui_operations.atomic_write',side_effect=OSError('접근 거부')):
+                with patch('gui.atomic_write',side_effect=OSError('접근 거부')):
                     app.operations.save()
                 text=app.log_text.get('1.0','end')
                 self.assertIn('OPERATIONS_SETTINGS_SAVE_FAILED',text)

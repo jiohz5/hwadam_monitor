@@ -64,6 +64,7 @@ def event_records(event):
     elif kind == 'catalog_done':
         value = event['value']
         add('CATALOG_DONE', f"목록 {'확보 중지' if value['cancelled'] else '확보 완료'} · {value['days']}일 저장 · 확인 필요 {len(value['errors'])}건")
+    elif kind == 'test_pay_done': add('BOOKING_TEST_DONE', '브라우저 예약 테스트 완료 · 최종 결제 미실행')
     elif kind == 'tested': add('TELEGRAM_TEST_SENT', '텔레그램 테스트 알림 전송 완료')
     elif kind == 'session_saved': add('SESSION_SAVED', f"로그인 확인 · 세션 쿠키 {event['value']}개 저장")
     elif kind == 'login_opened':
