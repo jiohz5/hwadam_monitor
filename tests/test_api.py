@@ -4,7 +4,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 
 from api import ApiError, AuthLost, LeisureClient, parse_order, rounds_path, decode_response
-from model import WatchConfig, parse_product
+from gui import WatchConfig, parse_product
 from test_model import PRODUCT
 
 

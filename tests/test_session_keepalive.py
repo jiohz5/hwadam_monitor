@@ -9,7 +9,7 @@ from urllib3.exceptions import ProtocolError
 
 from api import ApiError, LoginRequired
 from browser import BrowserSession
-from model import DEFAULT_URL
+from gui import DEFAULT_URL
 from test_browser import LoginDriver
 
 

@@ -22,7 +22,7 @@ class GuiSessionKeeperTests(unittest.TestCase):
 
     def test_stopped_monitor_renews_session_without_valid_watch_conditions(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder)); root.update()
+            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder), auto_open_browser=False); root.update()
             try:
                 self._require_keeper(app)
                 app.browser.driver = LoginDriver(logged=True)
@@ -43,7 +43,7 @@ class GuiSessionKeeperTests(unittest.TestCase):
 
     def test_auth_failure_reaches_home_without_starting_monitor_or_replacing_saved_file(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder)); root.update()
+            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder), auto_open_browser=False); root.update()
             try:
                 self._require_keeper(app)
                 app.browser.driver = LoginDriver(logged=False)
@@ -61,7 +61,7 @@ class GuiSessionKeeperTests(unittest.TestCase):
 
     def test_foreground_login_work_defers_background_navigation(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder)); root.update()
+            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder), auto_open_browser=False); root.update()
             try:
                 self._require_keeper(app)
                 driver = LoginDriver(logged=True)
@@ -78,7 +78,7 @@ class GuiSessionKeeperTests(unittest.TestCase):
 
     def test_close_cancels_idle_session_timer(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder)); root.update()
+            root = tk.Tk(); root.withdraw(); app = App(root, Path(folder), auto_open_browser=False); root.update()
             try:
                 self._require_keeper(app)
                 timer = app.keepalive_id

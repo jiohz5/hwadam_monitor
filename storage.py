@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import tempfile
 
-from model import WatchConfig
+from gui import WatchConfig
 
 
 def atomic_write(path: Path, text: str):
@@ -43,7 +43,18 @@ class SettingsStore:
 
     def save(self, config: WatchConfig):
         config.validate()
-        atomic_write(self.path, json.dumps(asdict(config), ensure_ascii=False, indent=2))
+        values = asdict(config)
+        try:
+            previous = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            previous = {}
+        except ValueError:
+            raise ValueError("기존 settings.json을 읽을 수 없어 덮어쓰지 않았습니다. 파일 형식을 확인하세요.") from None
+        if not isinstance(previous, dict):
+            raise ValueError("기존 settings.json이 객체 형식이 아니어서 덮어쓰지 않았습니다. 파일 형식을 확인하세요.")
+        if "NOL_MON_PIN" in previous:
+            values["NOL_MON_PIN"] = previous["NOL_MON_PIN"]
+        atomic_write(self.path, json.dumps(values, ensure_ascii=False, indent=2))
 
 
 def load_telegram_secrets(base: Path, *, environ=None):

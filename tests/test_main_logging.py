@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import main
-from model import Availability, Catalog, Snapshot
+from gui import Availability, Catalog, Snapshot
 
 
 class OfflineBrowser:

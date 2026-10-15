@@ -11,14 +11,16 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.by import By
 
 import gui
-from model import AGE_NAMES, DEFAULT_URL, WatchConfig
+from gui import AGE_NAMES, DEFAULT_URL, WatchConfig
 
 
 class BookingElement:
-    def __init__(self, text, *, attributes=None, enabled=True):
+    def __init__(self, text, *, attributes=None, enabled=True, children=None, on_click=None):
         self.text = text
         self.attributes = attributes or {}
         self.enabled = enabled
+        self.children = children or {}
+        self.on_click = on_click
         self.clicks = 0
         self.selected = False
 
@@ -26,7 +28,10 @@ class BookingElement:
         return self.attributes.get(name)
 
     def is_enabled(self):
-        return self.enabled
+        return self.enabled and 'disabled' not in self.attributes
+
+    def find_elements(self, by, selector):
+        return self.children.get((by, selector), [])
 
     def is_displayed(self):
         return True
@@ -37,6 +42,19 @@ class BookingElement:
     def click(self):
         self.clicks += 1
         self.selected = not self.selected
+        if self.on_click:
+            self.on_click()
+
+
+class BookingSwitchTo:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def window(self, handle):
+        if handle not in self.driver.window_handles:
+            raise ValueError('Unknown fake browser window')
+        self.driver.current_window_handle = handle
+        self.driver.current_url = self.driver.window_urls[handle]
 
 
 class BookingDriver:
@@ -44,22 +62,38 @@ class BookingDriver:
     current_url = DEFAULT_URL
 
     def __init__(self):
-        self.time = BookingElement('08:00 선택 가능', attributes={'aria-label': '08:00 선택'})
+        self.window_handles = ['product-tab']
+        self.current_window_handle = 'product-tab'
+        self.window_urls = {'product-tab': DEFAULT_URL}
+        self.switch_to = BookingSwitchTo(self)
+        self.time = BookingElement('08:00 선택 가능', attributes={'aria-label': '08:00 선택'},
+                                   children={(By.TAG_NAME, 'p'): [BookingElement('08:00')]})
         self.age = BookingElement('입장권 경로')
         self.price = BookingElement('일반 9,000원')
         self.buy = BookingElement('구매하기')
         self.money = BookingElement('NOL 머니')
         self.agree = BookingElement('전체 동의', attributes={'aria-label': '전체 동의'})
         self.other_checkbox = BookingElement('선택 정보 수신')
-        self.pay = BookingElement('9,000원 결제하기')
+        self.pay = BookingElement('9,000원 결제하기', on_click=self.open_payment_tab)
         self.has_pay = True
         self.has_agree = True
         self.actions = []
         self.service = Mock()
 
+    def open_payment_tab(self):
+        self.window_handles.append('payment-tab')
+        self.window_urls['payment-tab'] = 'https://nol-money.example.invalid/checkout'
+
     def find_elements(self, by, selector):
         self.actions.append(('find', by, selector))
+        # Never expose a PIN screen: the fake flow must stop before settings are read.
+        if '#mtk_pinCodeInput' in selector:
+            return []
         if '결제하기' in selector:
+            if "not(@aria-disabled='true')" in selector and self.pay.get_attribute('aria-disabled') == 'true':
+                return []
+            if "not(@data-state='loading')" in selector and self.pay.get_attribute('data-state') == 'loading':
+                return []
             return [self.pay] if self.has_pay else []
         if '구매하기' in selector:
             return [self.buy]
@@ -93,6 +127,7 @@ class BookingDriver:
     def get(self, url):
         self.actions.append(('navigate', url))
         self.current_url = url
+        self.window_urls[self.current_window_handle] = url
 
 
 class ImmediateWait:
@@ -208,7 +243,7 @@ class BookingGuiTests(PatchedTestCase):
         self.root.withdraw()
         self.app = gui.App.__new__(gui.App)
         self.addCleanup(self.close_app)
-        gui.App.__init__(self.app, self.root, Path(self.folder.name))
+        gui.App.__init__(self.app, self.root, Path(self.folder.name), auto_open_browser=False)
         self.root.update()
         self.panel = self.app.operations
         self.app.vars['times'].set('08:00')

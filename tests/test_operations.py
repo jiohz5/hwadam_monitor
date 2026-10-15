@@ -11,7 +11,7 @@ from gui import App
 class OperationsGuiTests(unittest.TestCase):
     def test_invalid_preferences_are_logged_without_values(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 panel=app.operations
                 panel.vars['method'].set('PRIVATE_INVALID_VALUE')
@@ -23,9 +23,9 @@ class OperationsGuiTests(unittest.TestCase):
 
     def test_preference_write_failure_is_logged(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
-                with patch('gui.atomic_write',side_effect=OSError('접근 거부')):
+                with patch('storage.atomic_write',side_effect=OSError('접근 거부')):
                     app.operations.save()
                 text=app.log_text.get('1.0','end')
                 self.assertIn('OPERATIONS_SETTINGS_SAVE_FAILED',text)
@@ -34,7 +34,7 @@ class OperationsGuiTests(unittest.TestCase):
 
     def test_admin_mode_changes_are_logged(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 panel=app.operations
                 panel.toggle_admin();panel.toggle_admin()
@@ -45,7 +45,7 @@ class OperationsGuiTests(unittest.TestCase):
 
     def test_admin_rehearsal_has_no_browser_payment_or_message_side_effects(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 self.assertIn('payment',app.pages)
                 self.assertIn('admin',app.pages)
@@ -65,7 +65,7 @@ class OperationsGuiTests(unittest.TestCase):
 
     def test_payment_preferences_restore_without_copying_reference_pin_or_credentials(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 self.assertIn('payment',app.pages)
                 panel=app.operations
@@ -75,7 +75,7 @@ class OperationsGuiTests(unittest.TestCase):
                 saved=json.loads((Path(folder)/'operation_settings.json').read_text(encoding='utf-8'))
                 self.assertEqual(set(saved),{'method','kind','quantity','stage'})
             finally: app.close()
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 self.assertEqual(app.operations.vars['method'].get(),'Npay')
                 self.assertEqual(app.operations.vars['stage'].get(),'전체 결제 (PIN까지)')
@@ -85,7 +85,7 @@ class OperationsGuiTests(unittest.TestCase):
 
     def test_admin_lock_stops_preview_and_keeps_watch_conditions_unchanged(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 self.assertIn('admin',app.pages)
                 before=app.read_config()

@@ -11,7 +11,7 @@ from selenium.common.exceptions import NoSuchWindowException
 
 from api import ApiError, LoginRequired
 from browser import BrowserSession
-from model import DEFAULT_URL
+from gui import DEFAULT_URL
 from test_browser import LoginDriver
 
 

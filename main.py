@@ -8,7 +8,7 @@ import sys
 import threading
 import traceback
 
-from model import DEFAULT_URL, SECTION_NAMES, WatchConfig, date_label, parse_time_specs
+from gui import DEFAULT_URL, SECTION_NAMES, WatchConfig, date_label, parse_time_specs
 from eventlog import persist_event
 from logfiles import create_app_logger
 from storage import sanitize
@@ -85,7 +85,7 @@ def gui(smoke=False):
     from gui import App
     root=tk.Tk()
     if smoke: root.withdraw()
-    app=App(root,BASE)
+    app=App(root,BASE,auto_open_browser=not smoke)
     if smoke:
         try:
             root.deiconify(); root.update()

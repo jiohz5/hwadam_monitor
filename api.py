@@ -4,7 +4,7 @@ import json
 import threading
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from model import AGE_NAMES, OPEN_CODES, Catalog, Snapshot, WatchConfig, evaluate_round, parse_product, time_matches, validate_url
+from gui import AGE_NAMES, OPEN_CODES, Catalog, Snapshot, WatchConfig, evaluate_round, parse_product, time_matches, validate_url
 
 
 AUTH_CODES = {"leisure-web-api-0013", "leisure-web-api-0015", "leisure-web-api-1802", "leisure-web-api-1501"}

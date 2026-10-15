@@ -6,7 +6,7 @@ import time
 import json
 
 from gui import App, QueryGuard, config_from_form
-from model import DEFAULT_URL, SECTION_NAMES, parse_product
+from gui import DEFAULT_URL, SECTION_NAMES, parse_product
 from test_api import FULL_PRODUCT
 from api import AuthLost
 from unittest.mock import Mock
@@ -32,7 +32,7 @@ class FormTests(unittest.TestCase):
 
     def test_live_logs_arrive_on_home_and_expanded_view_without_switching_tabs(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 app._log('입장권 08:20 조회 완료')
                 self.assertIn('입장권 08:20 조회 완료',app.home_log_text.get('1.0','end'))
@@ -52,7 +52,7 @@ class FormTests(unittest.TestCase):
             cache.put_rounds('10367229','2026-10-25',
                 [{'time':value} for value in ('08:05','08:25','08:35','08:55','09:00')],
                 section='MONORAIL_SEGMENT_2',parent_time='08:00')
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 app.vars['mono_relative'].set(True)
                 self.assertTrue(app.read_config().include_monorail)
@@ -63,7 +63,7 @@ class FormTests(unittest.TestCase):
                 self.assertEqual(app.read_config().monorail_specs_for('08:00'),('08:05~08:35',))
                 app.store.save(app.read_config())
             finally: app.close()
-            root=tk.Tk();root.withdraw();restored=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();restored=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 self.assertTrue(restored.read_config().mono_relative)
                 self.assertEqual(restored.secondary_list.selected,{'08:05','08:25','08:35'})
@@ -77,7 +77,7 @@ class FormTests(unittest.TestCase):
             cache.put_rounds('10367229','2026-10-25',[{'time':'08:00'},{'time':'08:20'}])
             cache.put_rounds('10367229','2026-10-25',[{'time':'08:30'},{'time':'08:35'}],section='MONORAIL_SEGMENT_2',parent_time='08:00')
             cache.put_rounds('10367229','2026-10-26',[{'time':'09:30'}],section='MONORAIL_SEGMENT_2',parent_time='09:00')
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 self.assertEqual(app.secondary_area.winfo_manager(),'pack','알림 포함 여부와 무관하게 모노레일 목록을 탐색할 수 있어야 한다')
                 for grid in (app.primary_list,app.secondary_list):
@@ -117,7 +117,7 @@ class FormTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root=tk.Tk()
             root.withdraw()
-            app=App(root,Path(folder))
+            app=App(root,Path(folder),auto_open_browser=False)
             try:
                 root.update()
                 self.assertEqual(app.read_config().counts,{'ADULT':2,'SENIOR':2,'TEEN':0,'CHILD':2})
@@ -125,6 +125,7 @@ class FormTests(unittest.TestCase):
                 self.assertFalse(app.runner.running)
                 self.assertIsNone(app.browser.driver)
                 self.assertGreater(app.left_content.winfo_reqheight(),100)
+                self.assertIsNone(app.browser_open_id)
                 self.assertTrue(hasattr(app,'login_button'),'전용 로그인 브라우저를 열 수 있어야 한다')
                 self.assertTrue(hasattr(app,'session_button'),'로그인 세션을 수동으로 저장할 수 있어야 한다')
             finally:
@@ -132,7 +133,7 @@ class FormTests(unittest.TestCase):
 
     def test_save_session_button_works_before_watch_conditions_are_valid(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder))
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False)
             try:
                 app.browser.driver=CookieDriver();app.browser.tab='own-tab'
                 app.vars['date'].set('날짜 미선택')
@@ -149,7 +150,7 @@ class FormTests(unittest.TestCase):
 
     def test_login_browser_reuses_valid_login_without_requesting_sign_in_again(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder))
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False)
             try:
                 app.browser.driver=CookieDriver();app.browser.tab='own-tab'
                 app.login_button.invoke()
@@ -169,7 +170,7 @@ class FormTests(unittest.TestCase):
             cache.put_rounds('10367229','2026-10-25',[{'time':'08:00','roundStatusCode':'SOLD_OUT'},
                                                     {'time':'08:20','roundStatusCode':'SOLD_OUT'}])
             cache.put_rounds('10323843','2026-10-03',[{'time':'09:00','roundStatusCode':'IN_SALE'}])
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder))
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False)
             try:
                 root.update()
                 app.primary_list.buttons['08:20'].invoke()
@@ -188,7 +189,7 @@ class FormTests(unittest.TestCase):
 
     def test_browse_choices_survive_restart_and_monorail_section_change(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder))
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False)
             try:
                 root.update()
                 app.vars['times'].set('08:20')
@@ -200,13 +201,13 @@ class FormTests(unittest.TestCase):
                 app.vars['section'].set(original)
                 self.assertEqual(app.vars['mono_times'].get(),'09:00')
             finally: app.close()
-            root=tk.Tk();root.withdraw();restored=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();restored=App(root,Path(folder),auto_open_browser=False);root.update()
             try: self.assertEqual(restored.vars['times'].get(),'08:20')
             finally: restored.close()
 
     def test_addon_browse_uses_only_requested_ages_and_isolates_orders(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 app.vars['mode'].set('addon')
                 app.vars['addon_url'].set(DEFAULT_URL+'?orderGroupId=first')
@@ -223,7 +224,7 @@ class FormTests(unittest.TestCase):
 
     def test_browse_monorail_menu_uses_earliest_entry_even_when_target_is_later(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder));root.update()
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False);root.update()
             try:
                 app.vars['include_monorail'].set(False);app.vars['times'].set('14:00')
                 client=Mock(lock=threading.RLock(),_order=None)
@@ -239,7 +240,7 @@ class FormTests(unittest.TestCase):
 
     def test_expired_auth_during_monorail_browse_is_not_reported_as_success(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=tk.Tk();root.withdraw();app=App(root,Path(folder))
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder),auto_open_browser=False)
             try:
                 app.vars['include_monorail'].set(True)
                 client=Mock(lock=threading.RLock(),_order=None)

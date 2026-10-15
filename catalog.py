@@ -7,7 +7,7 @@ from pathlib import Path
 import threading
 
 from api import ApiError, AuthLost, Cancelled, group_for
-from model import AGE_NAMES, DEFAULT_URL, REFERENCE_URL, KST, WatchConfig, time_matches
+from gui import AGE_NAMES, DEFAULT_URL, REFERENCE_URL, KST, WatchConfig, time_matches
 from storage import atomic_write, sanitize
 
 

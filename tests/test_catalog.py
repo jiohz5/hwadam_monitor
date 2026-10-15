@@ -6,7 +6,7 @@ import unittest
 
 from catalog import Catalogue, PRODUCTS, sync_catalogues
 from api import ApiError
-from model import parse_product
+from gui import parse_product
 from test_api import FULL_PRODUCT
 
 

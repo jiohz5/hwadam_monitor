@@ -4,7 +4,7 @@ from tkinter import ttk
 
 from catalog import PRODUCTS
 from branding import load_branding
-from model import AGE_NAMES, SECTION_NAMES, date_label
+from gui import AGE_NAMES, SECTION_NAMES, date_label
 from ui_widgets import BG, WHITE, INK, MUTED, GREEN, PALE, LINE, TONES, DateCalendar, TimeGrid, card, palette_styles, tint_card
 
 

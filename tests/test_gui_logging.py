@@ -5,7 +5,7 @@ import tkinter as tk
 import unittest
 
 from gui import App
-from model import Availability, Snapshot, WatchConfig
+from gui import Availability, Snapshot, WatchConfig
 
 
 class GuiLoggingTests(unittest.TestCase):
@@ -13,7 +13,7 @@ class GuiLoggingTests(unittest.TestCase):
         self.folder = tempfile.TemporaryDirectory()
         self.base = Path(self.folder.name)
         self.root = tk.Tk(); self.root.withdraw()
-        self.app = App(self.root, self.base)
+        self.app = App(self.root, self.base, auto_open_browser=False)
         self.root.update()
 
     def tearDown(self):
@@ -58,7 +58,7 @@ class GuiLoggingTests(unittest.TestCase):
         self.assertTrue(callable(getattr(self.app, '_emit', None)))
         self.app._emit({'kind':'started', 'config':config})
         log = self.logs()
-        for value in ('2026-10-25', '08:00~08:20', '성인 2장', '경로 2장', '어린이 2장', '+20분 ±15분', 'interval=10'):
+        for value in ('2026-10-25', '08:00~08:20', '성인 2장', '경로 2장', '어린이 2장', '+20분 ±15분', 'interval=2'):
             self.assertIn(value, log)
         self.assertNotIn('private-order-123', log)
         self.assertNotIn('secret', log)

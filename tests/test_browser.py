@@ -10,7 +10,7 @@ from api import ApiError, LoginRequired
 from urllib3.exceptions import ProtocolError
 from selenium.common.exceptions import NoSuchWindowException
 from browser import BrowserSession
-from model import DEFAULT_URL
+from gui import DEFAULT_URL
 
 
 class CookieDriver:

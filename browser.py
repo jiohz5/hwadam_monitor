@@ -23,7 +23,7 @@ from selenium.webdriver.edge.service import Service
 from urllib3.exceptions import HTTPError
 
 from api import AUTH_CODES, ApiError, LoginRequired
-from model import KST, validate_url
+from gui import KST, validate_url
 from storage import atomic_write
 
 
@@ -111,6 +111,7 @@ class BrowserSession:
         self.lock = threading.RLock()
         self.driver = None
         self.tab = None
+        self._positioned_browser = None
         self.headers = {}
         self.ready_url = None
         self.headers_at = 0.0
@@ -251,6 +252,29 @@ class BrowserSession:
             time.sleep(0.25)
         raise ApiError("전용 Edge에 연결하지 못했습니다. 전용 프로필 창을 닫고 다시 브라우저를 열어주세요")
 
+    def _place_window(self):
+        """현재 모니터 작업 영역의 오른쪽 40%에 전용 브라우저를 배치한다."""
+        available = self.driver.execute_script("""
+            return {left: screen.availLeft ?? 0, top: screen.availTop ?? 0,
+                    width: screen.availWidth, height: screen.availHeight};
+        """)
+        if not isinstance(available,dict) or any(
+                not isinstance(available.get(key),(int,float)) or not math.isfinite(available[key])
+                for key in ('left','top','width','height')):
+            raise ValueError('모니터 작업 영역을 확인하지 못했습니다')
+        if available['width']<=0 or available['height']<=0:
+            raise ValueError('모니터 작업 영역이 비어 있습니다')
+        width = max(1,round(available['width']*.40))
+        bounds = {'left':round(available['left']+available['width'])-width,
+                  'top':round(available['top']),'width':width,'height':round(available['height'])}
+        window = self.driver.execute_cdp_cmd('Browser.getWindowForTarget',{})
+        window_id = window['windowId']
+        if window.get('bounds',{}).get('windowState')!='normal':
+            self.driver.execute_cdp_cmd('Browser.setWindowBounds',
+                                        {'windowId':window_id,'bounds':{'windowState':'normal'}})
+        self.driver.execute_cdp_cmd('Browser.setWindowBounds',{'windowId':window_id,'bounds':bounds})
+        self.log('[BROWSER_WINDOW_PLACED] 전용 Edge · 화면 오른쪽 40% · 작업 영역 전체 높이')
+
     def _attach(self,url):
         if self.driver is not None:
             try:
@@ -273,6 +297,14 @@ class BrowserSession:
         self.headers = {}
         self.ready_url = None
         self._diag('BROWSER_ATTACHED',browser_major=match.group(1).split('.')[0])
+        identity = info.get('webSocketDebuggerUrl')
+        if not identity or self._positioned_browser!=identity:
+            try:
+                self._place_window()
+            except (WebDriverException,HTTPError,OSError,ValueError,TypeError,KeyError) as error:
+                self.log(f'[BROWSER_WINDOW_FAILED] 창 배치 실패 · {type(error).__name__}')
+            else:
+                self._positioned_browser = identity
 
     def _select(self):
         handles = self.driver.window_handles

@@ -1,6 +1,6 @@
 import unittest
 
-from model import WatchConfig, evaluate_round, parse_product, time_matches
+from gui import WatchConfig, evaluate_round, parse_product, time_matches
 
 
 PRODUCT = {

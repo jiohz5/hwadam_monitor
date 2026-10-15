@@ -7,7 +7,7 @@ import re
 import sys
 import uuid
 
-from model import KST
+from gui import KST
 from storage import atomic_write, sanitize
 
 

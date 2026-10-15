@@ -3,9 +3,9 @@ import time
 import unittest
 
 from api import AuthLost, Cancelled
-from model import Availability, Snapshot, WatchConfig
-from monitor import AlertTracker, MonitorRunner, format_alert
-from model import evaluate_round, parse_product
+from gui import Availability, Snapshot, WatchConfig
+from gui import AlertTracker, MonitorRunner, format_alert
+from gui import evaluate_round, parse_product
 from test_model import PRODUCT
 
 

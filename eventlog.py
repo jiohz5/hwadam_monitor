@@ -2,7 +2,7 @@
 import logging
 
 from catalog import product_id
-from model import AGE_NAMES, count_label, date_label
+from gui import AGE_NAMES, count_label, date_label
 
 
 def watch_summary(config):
