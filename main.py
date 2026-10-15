@@ -2,12 +2,15 @@
 import argparse
 from dataclasses import asdict
 import json
+import logging
 from pathlib import Path
 import sys
 import threading
 import traceback
 
 from model import DEFAULT_URL, SECTION_NAMES, WatchConfig, date_label, parse_time_specs
+from eventlog import persist_event
+from logfiles import create_app_logger
 from storage import sanitize
 
 
@@ -33,26 +36,46 @@ def arguments():
     return parser.parse_args()
 
 
-def probe(args):
+def cli_output(logger, message, *, event='CLI_PROGRESS', level=logging.INFO):
+    message=sanitize(message)
+    if logger is not None: logger.log(level,message,extra={'event':event})
+    print(message,flush=True)
+
+
+def print_json(value, *, indent=None):
+    def clean(item):
+        if isinstance(item,str): return sanitize(item)
+        if isinstance(item,dict): return {key:clean(value) for key,value in item.items()}
+        if isinstance(item,(list,tuple)): return [clean(value) for value in item]
+        return item
+    print(json.dumps(clean(value),ensure_ascii=False,indent=indent),flush=True)
+
+
+def probe(args, logger=None):
     from api import LeisureClient
     from browser import BrowserSession
     config=WatchConfig(mode='addon' if args.addon_url else 'entry',product_url=args.product_url,
        addon_url=args.addon_url,date=args.date,time_specs=parse_time_specs(args.times),
        counts={age:getattr(args,age.lower()) for age in ('ADULT','SENIOR','TEEN','CHILD')},
        include_monorail=args.monorail,mono_specs=parse_time_specs(args.mono_times),section=args.section).validate()
-    browser=BrowserSession(BASE,lambda text:print(sanitize(text),flush=True))
+    browser=BrowserSession(BASE,lambda text:cli_output(logger,text,event='BROWSER'))
     try:
         client=LeisureClient(browser)
         catalog=client.prepare(config)
-        print('상품',catalog.id,catalog.name,flush=True)
+        cli_output(logger,f'상품 {catalog.id} {catalog.name}',event='PROBE_PRODUCT')
         dates=client.schedules(config)
         mono=config.mode=='addon'
         rounds=client.rounds(config,monorail=mono,entry_time=client._order.entry_time if mono else None)
-        print('날짜',len(dates),'회차',len(rounds),flush=True)
+        cli_output(logger,f'날짜 {len(dates)} 회차 {len(rounds)}',event='PROBE_CATALOG')
         snapshot=client.check(config,threading.Event())
-        print(json.dumps({'date':date_label(config.date),'rounds':[asdict(row) for row in snapshot.rounds],
+        if logger is not None:
+            logger.info('조회 결과 date=%s rounds=%s hits=%s monorail=%s monorail_error=%s',
+                        config.date,len(snapshot.rounds),len(snapshot.hits),len(snapshot.monorail),
+                        int(bool(snapshot.monorail_error)),extra={'event':'PROBE_RESULT'})
+            persist_event(logger,{'kind':'snapshot','snapshot':snapshot,'checks':1})
+        print_json({'date':date_label(config.date),'rounds':[asdict(row) for row in snapshot.rounds],
                           'monorail':[asdict(row) for row in snapshot.monorail],
-                          'monorail_error':sanitize(snapshot.monorail_error)},ensure_ascii=False,indent=2),flush=True)
+                          'monorail_error':snapshot.monorail_error},indent=2)
     finally:
         browser.detach()
 
@@ -82,36 +105,55 @@ def gui(smoke=False):
     else: root.mainloop()
 
 
-def sync_catalog(args):
+def sync_catalog(args, logger=None):
     from api import LeisureClient
     from browser import BrowserSession
     from catalog import Catalogue, sync_catalogues
-    browser=BrowserSession(BASE,lambda text:print(sanitize(text),flush=True))
+    browser=BrowserSession(BASE,lambda text:cli_output(logger,text,event='BROWSER'))
+    def progress(event):
+        failed=event.get('kind')=='catalog_error'
+        cli_output(logger,event['message'],event='CATALOG_ERROR' if failed else 'CATALOG_PROGRESS',
+                   level=logging.WARNING if failed else logging.INFO)
     try:
         result=sync_catalogues(LeisureClient(browser),Catalogue(BASE),threading.Event(),
-                              lambda event:print(sanitize(event['message']),flush=True),resume=args.resume)
-        print(json.dumps(result,ensure_ascii=False),flush=True)
+                              progress,resume=args.resume)
+        if logger is not None:
+            logger.info('목록 확보 결과 days=%s errors=%s cancelled=%s',result['days'],
+                        len(result['errors']),int(result['cancelled']),extra={'event':'CATALOG_RESULT'})
+        print_json(result)
     finally: browser.detach()
 
 
 def main():
     args=arguments()
+    mode='probe' if args.probe else 'sync-catalog' if args.sync_catalog else 'gui-smoke' if args.gui_smoke else 'gui'
+    logger=handler=None
     try:
-        if args.probe: probe(args)
-        elif args.sync_catalog: sync_catalog(args)
+        if args.probe or args.sync_catalog:
+            logger,handler=create_app_logger(BASE)
+            logger.info('CLI 실행 시작 mode=%s',mode,extra={'event':'CLI_START'})
+        if args.probe: probe(args,logger)
+        elif args.sync_catalog: sync_catalog(args,logger)
         else: gui(args.gui_smoke)
+        if logger is not None: logger.info('CLI 실행 완료 mode=%s',mode,extra={'event':'CLI_COMPLETE'})
         return 0
     except Exception as error:
-        message=sanitize(traceback.format_exc())
-        (BASE/'logs').mkdir(parents=True,exist_ok=True)
-        (BASE/'logs'/'startup_error.log').write_text(message,encoding='utf-8')
+        if logger is None: logger,handler=create_app_logger(BASE)
+        locations=';'.join(f'{Path(frame.f_code.co_filename).name}:{line}:{frame.f_code.co_name}'
+                           for frame,line in traceback.walk_tb(error.__traceback__))
+        logger.error('실행 오류 mode=%s error_type=%s location=%s',mode,type(error).__name__,locations,
+                     extra={'event':'APP_ERROR'})
         if sys.stderr is not None: print(sanitize(error),file=sys.stderr)
         if not args.probe and not args.gui_smoke and not args.sync_catalog:
             try:
                 from tkinter import messagebox
-                messagebox.showerror('화담숲 모니터 실행 오류',sanitize(error)+'\nlogs/startup_error.log를 확인하세요.')
+                messagebox.showerror('화담숲 모니터 실행 오류',sanitize(error)+'\nlogs 폴더의 오늘 날짜 hwadam 로그를 확인하세요.')
             except Exception: pass
         return 2
+    finally:
+        if handler is not None:
+            logger.removeHandler(handler)
+            handler.close()
 
 
 if __name__=='__main__': sys.exit(main())

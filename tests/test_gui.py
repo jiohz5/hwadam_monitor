@@ -147,6 +147,22 @@ class FormTests(unittest.TestCase):
                 self.assertFalse(app.runner.running)
             finally: app.close()
 
+    def test_login_browser_reuses_valid_login_without_requesting_sign_in_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=tk.Tk();root.withdraw();app=App(root,Path(folder))
+            try:
+                app.browser.driver=CookieDriver();app.browser.tab='own-tab'
+                app.login_button.invoke()
+                deadline=time.monotonic()+3
+                while app.busy and time.monotonic()<deadline:
+                    root.update();time.sleep(.01)
+                self.assertFalse(app.busy)
+                self.assertIn('로그인 유지 확인',app.session_status.get())
+                self.assertNotIn('로그인 후',app.status.get())
+                self.assertTrue((Path(folder)/'session_cookies.json').is_file())
+                self.assertFalse(app.runner.running)
+            finally: app.close()
+
     def test_checked_times_stay_with_their_product_when_browsing_between_products(self):
         with tempfile.TemporaryDirectory() as folder:
             cache=Catalogue(Path(folder))

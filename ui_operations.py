@@ -62,10 +62,14 @@ class OperationsUI:
     def save(self):
         values={key:value.get() for key,value in self.vars.items()}
         if any(values[key] not in choices for key,choices in OPTIONS.items()):
-            self.payment_status.set('목록에서 결제 준비 옵션을 선택하세요.');return
+            self.payment_status.set('목록에서 결제 준비 옵션을 선택하세요.')
+            self.app._log('[OPERATIONS_SETTINGS_INVALID] 결제 준비 설정 확인 필요 · 목록에서 옵션을 선택하세요.')
+            return
         try: atomic_write(self.path,json.dumps(values,ensure_ascii=False,indent=2))
         except OSError as error:
-            self.payment_status.set('저장 실패 · '+sanitize(error));return
+            self.payment_status.set('저장 실패 · '+sanitize(error))
+            self.app._log('[OPERATIONS_SETTINGS_SAVE_FAILED] 결제 준비 설정 저장 실패 · '+sanitize(error))
+            return
         self.payment_status.set('결제 준비·테스트 시나리오 저장 완료')
         self.app._log('결제 GUI 설정 저장 · 결제수단 선호 및 테스트 시나리오')
 
@@ -151,6 +155,7 @@ class OperationsUI:
         if not self.admin_enabled and self.rehearsing: self.stop_preview()
         self.unlock_button.configure(text='관리 모드 닫기' if self.admin_enabled else '관리 모드 열기')
         self.admin_status.set('관리 도구 활성화 · 로컬 화면 테스트' if self.admin_enabled else '관리 모드 닫힘')
+        self.app._log('[ADMIN_MODE_OPENED] 관리 모드 열림' if self.admin_enabled else '[ADMIN_MODE_CLOSED] 관리 모드 닫힘')
         self._buttons()
 
     def _buttons(self):

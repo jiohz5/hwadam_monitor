@@ -2,6 +2,7 @@ import threading
 import time
 import unittest
 
+from api import AuthLost, Cancelled
 from model import Availability, Snapshot, WatchConfig
 from monitor import AlertTracker, MonitorRunner, format_alert
 from model import evaluate_round, parse_product
@@ -80,6 +81,66 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(runner.running)
         self.assertEqual(sent,[])
         self.assertEqual(events[-1]['kind'],'finished')
+        self.assertEqual(events[-1].get('reason'),'user_stop')
+        self.assertEqual(events[-1].get('checks'),0)
+
+    def test_successful_notification_records_the_checked_snapshot(self):
+        events=[]; stop=threading.Event(); result=snapshot()
+        class Client:
+            def check(self,config,cancel): return result
+        class Notifier:
+            def send(self,text): stop.set()
+        config=WatchConfig()
+        MonitorRunner(Client(),events.append)._run(config,Notifier(),stop)
+        sent=next(event for event in events if event['kind']=='sent')
+        self.assertIs(sent.get('snapshot'),result)
+        self.assertEqual(sent.get('hits'),1)
+        self.assertIs(events[0]['config'],config)
+        self.assertEqual(events[-1].get('checks'),1)
+
+    def test_retry_error_identifies_check_or_notification_phase(self):
+        for phase,checks in (('check',0),('telegram',1)):
+            with self.subTest(phase=phase):
+                events=[]; stop=threading.Event()
+                class Client:
+                    def check(self,config,cancel):
+                        if phase=='check': raise RuntimeError('조회 실패')
+                        return snapshot()
+                class Notifier:
+                    def send(self,text): raise RuntimeError('전송 실패')
+                def emit(event):
+                    events.append(event)
+                    if event['kind']=='error': stop.set()
+                MonitorRunner(Client(),emit)._run(WatchConfig(),Notifier(),stop)
+                error=next(event for event in events if event['kind']=='error')
+                self.assertEqual(error.get('phase'),phase)
+                self.assertEqual(error.get('failures'),1)
+                self.assertEqual(error.get('retry_seconds'),10)
+                self.assertEqual(events[-1].get('checks'),checks)
+
+    def test_authentication_stop_and_failed_stop_notice_are_distinguishable(self):
+        events=[]
+        class Client:
+            def check(self,config,stop): raise AuthLost('로그인 만료')
+        class Notifier:
+            def send(self,text): raise RuntimeError('중지 알림 전송 실패')
+        MonitorRunner(Client(),events.append)._run(WatchConfig(),Notifier(),threading.Event())
+        auth=next(event for event in events if event['kind']=='auth')
+        notice=next(event for event in events if event['kind']=='error')
+        self.assertEqual(auth.get('phase'),'check')
+        self.assertEqual(auth.get('retry_seconds'),0)
+        self.assertEqual(notice.get('phase'),'telegram')
+        self.assertEqual(notice.get('failures'),1)
+        self.assertEqual(notice.get('retry_seconds'),0)
+        self.assertEqual(events[-1].get('reason'),'auth_lost')
+        self.assertEqual(events[-1].get('checks'),0)
+
+    def test_cancellation_without_user_stop_has_its_own_reason(self):
+        events=[]
+        class Client:
+            def check(self,config,stop): raise Cancelled()
+        MonitorRunner(Client(),events.append)._run(WatchConfig(),None,threading.Event())
+        self.assertEqual(events[-1].get('reason'),'cancelled')
 
     def test_successful_send_and_notification_failure_are_reported(self):
         finished=threading.Event(); events=[]

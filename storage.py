@@ -74,4 +74,4 @@ def save_telegram_secrets(base: Path, token: str, chat_id: str):
 
 def sanitize(text: str):
     text = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{8,}\b", "<봇 토큰 숨김>", str(text))
-    return re.sub(r"(orderGroupId=)[^&\s]+", r"\1<주문번호 숨김>", text)
+    return re.sub(r"(orderGroupId=)(?!<주문번호 숨김>)[^&\s]+", r"\1<주문번호 숨김>", text)

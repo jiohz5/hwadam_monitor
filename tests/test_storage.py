@@ -4,10 +4,16 @@ import unittest
 from pathlib import Path
 
 from model import WatchConfig
-from storage import SettingsStore, load_telegram_secrets, save_telegram_secrets
+from storage import SettingsStore, load_telegram_secrets, save_telegram_secrets, sanitize
 
 
 class StorageTests(unittest.TestCase):
+    def test_redaction_remains_readable_across_gui_and_file_logging(self):
+        text='주문 orderGroupId=private-order&next=1 · bot=123456:abcdefghijk'
+        clean=sanitize(text)
+        self.assertNotIn('private-order',clean)
+        self.assertEqual(sanitize(sanitize(clean)),clean)
+
     def test_round_trip_keeps_senior_goal_and_multiple_times(self):
         with tempfile.TemporaryDirectory() as temp:
             store=SettingsStore(Path(temp))

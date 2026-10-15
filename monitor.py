@@ -115,10 +115,12 @@ class MonitorRunner:
         tracker=AlertTracker()
         failures=0
         checks=0
+        reason='user_stop'
         try:
             self._event('started',config=config)
             while not stop.is_set():
                 delay=config.interval
+                phase='check'
                 try:
                     result=self.client.check(config,stop)
                     if stop.is_set(): break
@@ -126,24 +128,28 @@ class MonitorRunner:
                     self._event('snapshot',snapshot=result,checks=checks)
                     if tracker.pending(result):
                         if stop.is_set(): break
+                        phase='telegram'
                         notifier.send(format_alert(result))
                         tracker.ack(result)
-                        self._event('sent',message='가용 회차 텔레그램 알림 전송 완료')
+                        self._event('sent',message='가용 회차 텔레그램 알림 전송 완료',snapshot=result,hits=len(result.hits))
                     failures=0
                 except Cancelled:
+                    reason='user_stop' if stop.is_set() else 'cancelled'
                     break
                 except AuthLost as problem:
-                    self._event('auth',message=sanitize(problem))
+                    reason='auth_lost'
+                    self._event('auth',message=sanitize(problem),phase=phase,failures=failures+1,retry_seconds=0)
                     if not stop.is_set():
                         try:
                             notifier.send('화담숲 감시가 중지되었습니다. NOL 로그인 후 다시 시작하세요.\n'+date_label(config.date))
                         except Exception as error:
-                            self._event('error',message=sanitize(error))
+                            self._event('error',message=sanitize(error),phase='telegram',failures=1,retry_seconds=0)
                     break
                 except Exception as problem:
                     failures+=1
                     delay=min(300,max(config.interval,10)*(2**min(failures-1,4)))
-                    self._event('error',message=sanitize(problem)+f' · {delay:g}초 후 재시도')
+                    self._event('error',message=sanitize(problem)+f' · {delay:g}초 후 재시도',
+                                phase=phase,failures=failures,retry_seconds=delay)
                 stop.wait(delay)
         finally:
-            self._event('finished',message='감시 종료')
+            self._event('finished',message='감시 종료',reason=reason,checks=checks)

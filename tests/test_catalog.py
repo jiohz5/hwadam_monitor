@@ -5,11 +5,50 @@ import threading
 import unittest
 
 from catalog import Catalogue, PRODUCTS, sync_catalogues
+from api import ApiError
 from model import parse_product
 from test_api import FULL_PRODUCT
 
 
 class CatalogueTests(unittest.TestCase):
+    def test_each_entry_error_is_emitted_before_consecutive_failures_abort(self):
+        events=[]
+        class Client:
+            def load_catalog(self,url,refresh=False): return parse_product(FULL_PRODUCT)
+            def schedules(self,config):
+                return [{'date':date} for date in ('2026-10-25','2026-10-26','2026-10-27')]
+            def rounds(self,config,**kwargs): raise ApiError('접속 오류')
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(ApiError):
+                sync_catalogues(Client(),Catalogue(Path(folder)),threading.Event(),events.append,
+                    products=(PRODUCTS[0],),delay=0,today='2026-10-03')
+        errors=[event for event in events if event['kind']=='catalog_error']
+        self.assertEqual(len(errors),3)
+        self.assertEqual([event.get('date') for event in errors],['2026-10-25','2026-10-26','2026-10-27'])
+        for event in errors:
+            self.assertEqual(event.get('product_id'),'10367229')
+            self.assertEqual(event.get('phase'),'entry')
+            self.assertIn('접속 오류',event['message'])
+
+    def test_monorail_error_is_emitted_with_section_and_preserved_in_result(self):
+        events=[]
+        class Client:
+            def load_catalog(self,url,refresh=False): return parse_product(FULL_PRODUCT)
+            def schedules(self,config): return [{'date':'2026-10-25'}]
+            def rounds(self,config,monorail=False,entry_time=None):
+                if monorail: raise ApiError('모노레일 조회 실패')
+                return [{'time':'08:00','roundStatusCode':'SOLD_OUT','inventoryQuantity':0}]
+        with tempfile.TemporaryDirectory() as folder:
+            result=sync_catalogues(Client(),Catalogue(Path(folder)),threading.Event(),events.append,
+                products=(PRODUCTS[0],),delay=0,today='2026-10-03')
+        errors=[event for event in events if event['kind']=='catalog_error']
+        self.assertEqual(len(errors),1)
+        self.assertEqual(errors[0].get('phase'),'monorail')
+        self.assertEqual(errors[0].get('section'),'MONORAIL_SEGMENT_2')
+        self.assertEqual(errors[0].get('product_id'),'10367229')
+        self.assertEqual(errors[0].get('date'),'2026-10-25')
+        self.assertEqual(result['errors'],[errors[0]['message']])
+
     def test_resume_reads_only_incomplete_days_and_keeps_full_date_menu(self):
         class Client:
             def __init__(self): self.requests=[]

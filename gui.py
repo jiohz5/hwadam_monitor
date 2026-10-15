@@ -4,10 +4,10 @@ import datetime as dt
 import logging
 import json
 import hashlib
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import queue
 import threading
+import traceback
 import tkinter as tk
 from tkinter import messagebox, ttk
 import webbrowser
@@ -15,6 +15,8 @@ import webbrowser
 from api import AuthLost, LeisureClient
 from browser import BrowserSession
 from catalog import Catalogue, PRODUCTS, product_id, sync_catalogues
+from eventlog import persist_event
+from logfiles import create_app_logger
 from model import AGE_NAMES, DEFAULT_URL, REFERENCE_URL, SECTION_NAMES, WatchConfig, count_label, date_label, parse_time_specs, relative_monorail_specs, time_matches, validate_url
 from monitor import MonitorRunner
 from storage import SettingsStore, atomic_write, load_telegram_secrets, sanitize, save_telegram_secrets
@@ -47,11 +49,16 @@ class App:
         self.base=Path(base_dir)
         self.closed=False
         self.busy=False
+        self.session_pending=False
         self.syncing=False
         self.catalog_stop=threading.Event()
         self.mutating=False
         self.events=queue.Queue()
         self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='hwadam-query')
+        self.pending_jobs=set()
+        self.jobs_lock=threading.Lock()
+        self._event_persisted=False
+        self._status_keys={}
         self.guard=QueryGuard()
         self.store=SettingsStore(self.base)
         config,warning=self.store.load()
@@ -78,7 +85,7 @@ class App:
         self.condition_widgets=[]
         self.widget_states={}
         self.status=tk.StringVar(value='대기 · 조건을 확인하고 브라우저를 연결하세요')
-        self.session_status=tk.StringVar(value='세션 저장 파일 있음 · 로그인 확인 필요' if (self.base/'session_cookies.json').is_file() else '로그인 세션 미저장 · 로그인 후 세션 저장하세요')
+        self.session_status=tk.StringVar(value='저장된 세션 있음 · 연결 시 자동 확인' if (self.base/'session_cookies.json').is_file() else '로그인 세션 미저장 · 로그인 후 세션 저장하세요')
         self.detail=tk.StringVar(value='성인 2 · 경로 2 · 어린이 2 | 가용 1장부터 알림')
         self.primary_title=tk.StringVar(value='입장 회차 · 여러 개 선택 가능')
         self.product_title=tk.StringVar(value=(self.catalogue.product(product_id(config.product_url)) or {}).get('name','화담숲 입장권'))
@@ -88,16 +95,14 @@ class App:
         self.selection_count=tk.StringVar(value='선택한 회차')
         self.selection_summary=tk.StringVar(value='')
         self.order_label=tk.StringVar(value='추가구매는 입장권 주문에서 연 모노레일 주소를 붙여넣으세요.')
-        self.logger=logging.getLogger(f'hwadam.{id(self)}')
-        self.logger.setLevel(logging.INFO)
-        self.logger.propagate=False
-        (self.base/'logs').mkdir(parents=True,exist_ok=True)
-        self.log_handler=RotatingFileHandler(self.base/'logs'/'hwadam.log',maxBytes=1024*1024,backupCount=3,encoding='utf-8')
-        self.log_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
-        self.logger.addHandler(self.log_handler)
-        self.browser=BrowserSession(self.base,lambda text:self.events.put({'kind':'log','message':text}))
+        self.logger,self.log_handler=create_app_logger(self.base)
+        self.root.report_callback_exception=self._callback_exception
+        self.logger.info('프로그램 시작 · GUI',extra={'event':'APP_STARTED'})
+        for variable,code in ((self.status,'UI_STATUS'),(self.session_status,'SESSION_STATUS')):
+            variable.trace_add('write',lambda *_,value=variable,event_code=code:self._status_changed(value,event_code))
+        self.browser=BrowserSession(self.base,lambda text:self._emit({'kind':'log','message':text}))
         self.client=LeisureClient(self.browser)
-        self.runner=MonitorRunner(self.client,self.events.put)
+        self.runner=MonitorRunner(self.client,self._emit)
         self.browse_key=self._choice_key()
         previous=self.choices['times'].get(self.browse_key)
         if previous:
@@ -111,6 +116,7 @@ class App:
         self._mode_changed()
         self.root.protocol('WM_DELETE_WINDOW',self.close)
         self.poll_id=self.root.after(100,self._poll)
+        self.keepalive_id=self.root.after(30000,self._keep_session_alive)
         self._log(warning or self.catalogue.warning or '준비 완료 · 상품을 선택하고 날짜와 회차를 체크하세요')
 
     def _show_page(self,name):
@@ -241,7 +247,7 @@ class App:
         self.status.set('두 상품의 날짜·회차 목록을 확보하는 중…')
         def job():
             with self.client.lock:
-                return sync_catalogues(self.client,self.catalogue,self.catalog_stop,self.events.put,resume=True)
+                return sync_catalogues(self.client,self.catalogue,self.catalog_stop,self._emit,resume=True)
         self._submit(job,'catalog_done')
 
     def _condition(self,widget):
@@ -318,13 +324,39 @@ class App:
         return ('품절' if status=='SOLD_OUT' or row.get('inventoryQuantity')==0 else
                 '판매 중' if status in ('IN_SALE','OPEN','AVAILABLE') else '판매 상태 확인 필요')
 
+    def _emit(self,event):
+        # Tk 큐가 지연되거나 창이 닫혀도 작업 결과는 발생 시점에 저장한다.
+        persist_event(self.logger,event)
+        if not self.closed: self.events.put({**event,'_persisted':True})
+
+    def _callback_exception(self,error_type,error,tb):
+        locations=';'.join(f'{Path(frame.f_code.co_filename).name}:{line}:{frame.f_code.co_name}'
+                           for frame,line in traceback.walk_tb(tb))
+        self.logger.error('화면 처리 오류 error_type=%s location=%s',error_type.__name__,locations,
+                          extra={'event':'GUI_CALLBACK_FAILED'})
+
+    def _background(self,work):
+        future=self.executor.submit(work)
+        with self.jobs_lock: self.pending_jobs.add(future)
+        def completed(done):
+            with self.jobs_lock: self.pending_jobs.discard(done)
+        future.add_done_callback(completed)
+
+    def _status_changed(self,variable,code):
+        text=sanitize(variable.get())
+        key='NOL 연결 정상' if text.startswith('NOL 연결 정상 · ') else text
+        previous=self._status_keys.get(code)
+        self._status_keys[code]=key
+        if key!=previous and not self._event_persisted:
+            self.logger.info(text,extra={'event':code})
+
     def _submit(self,job,kind,*,ticket=None):
         self.busy=True; self._buttons()
         def work():
             try: event={'kind':kind,'value':job(),'ticket':ticket}
-            except Exception as error: event={'kind':'job_error','message':sanitize(error),'ticket':ticket,'auth':isinstance(error,AuthLost)}
-            self.events.put(event)
-        self.executor.submit(work)
+            except Exception as error: event={'kind':'job_error','operation':kind,'message':sanitize(error),'ticket':ticket,'auth':isinstance(error,AuthLost)}
+            self._emit(event)
+        self._background(work)
 
     def _session_url(self):
         addon=self.vars['mode'].get()=='addon' and self.vars['addon_url'].get().strip()
@@ -343,6 +375,43 @@ class App:
         except ValueError as error: self._problem(error); return
         self.status.set('로그인 확인 후 세션을 저장하는 중…')
         self._submit(lambda:self.browser.save_login_session(url),'session_saved')
+
+    def _keep_session_alive(self):
+        if self.closed: return
+        self.root.after_cancel(self.keepalive_id)
+        self.keepalive_id=self.root.after(60000,self._keep_session_alive)
+        # 감시 루프는 자체 갱신을 수행한다. 로그인·탐색 작업 중에는 이동하지 않는다.
+        if self.busy or self.runner.running or self.session_pending: return
+        try: url=validate_url(self.vars['product_url'].get())
+        except ValueError: url=DEFAULT_URL
+        self.session_pending=True
+        def work():
+            event={'kind':'session_maintenance','value':{'state':'busy'}}
+            if not self.closed and self.client.lock.acquire(blocking=False):
+                try:
+                    if not self.closed:
+                        event['value']=self.browser.maintain_session(url)
+                except Exception as error:
+                    event={'kind':'session_maintenance','message':sanitize(error),'auth':isinstance(error,AuthLost)}
+                finally:
+                    self.client.lock.release()
+            self._emit(event)
+        self._background(work)
+
+    def _show_session_maintenance(self,event):
+        self.session_pending=False
+        if 'message' in event:
+            self.session_status.set('로그인 유지 중단 · 전용 Edge에서 다시 로그인하세요' if event.get('auth')
+                                    else '로그인 유지 확인 지연 · 자동 재시도 대기')
+            self._log('로그인 유지 실패 · '+event['message'])
+            return
+        result=event['value']
+        if result['state'] not in ('checked','renewed'): return
+        expiry=result.get('expires_at',0)
+        suffix=('만료 예정 '+dt.datetime.fromtimestamp(expiry,dt.timezone(dt.timedelta(hours=9))).strftime('%m/%d %H:%M:%S')
+                if expiry else '만료 시각 미공개')
+        prefix='로그인 유지 확인' if result['state']=='renewed' else '세션 쿠키 점검 '+dt.datetime.now().strftime('%H:%M')
+        self.session_status.set(prefix+' · '+suffix)
 
     def _browse_config(self):
         values={key:value.get() for key,value in self.vars.items()}
@@ -468,50 +537,66 @@ class App:
 
     def _poll(self):
         if self.closed: return
+        self.root.after_cancel(self.poll_id)
         while True:
             try: event=self.events.get_nowait()
             except queue.Empty: break
-            kind=event['kind']
-            if kind in ('loaded','tested','login_opened','session_saved','catalog_done','job_error'):
-                self.busy=False
-                if event.get('auth'): self.session_status.set('로그인 만료 · 전용 Edge에서 다시 로그인하세요')
-                if kind in ('catalog_done','job_error'): self.syncing=False
-                ticket=event.get('ticket')
-                if ticket is not None and not self.guard.accepts(ticket):
-                    self._log('조건이 변경되어 이전 조회 결과를 제외했습니다. 다시 읽어주세요.')
-                    self.status.set('조건 변경 · 회차 새로고침 필요')
-                elif kind=='loaded': self._show_loaded(event['value'])
-                elif kind=='tested': self._log('텔레그램 테스트 알림 전송 완료')
-                elif kind=='login_opened':
-                    self.status.set('전용 Edge 로그인 후 로그인 세션 저장을 누르세요')
-                    self._log('로그인 브라우저 준비 완료 · 로그인 후 세션 저장 필요')
-                elif kind=='session_saved':
-                    self.status.set('로그인 세션 저장 완료 · 브라우저 연결·목록 읽기를 누르세요')
-                    self.session_status.set('세션 저장 완료 · '+dt.datetime.now().strftime('%H:%M:%S'))
-                    self._log(f"로그인 확인 · 세션 쿠키 {event['value']}개 저장 · session_cookies.json")
-                elif kind=='catalog_done':
-                    result=event['value'];self._cached_view()
-                    message=f"목록 {'확보 중지' if result['cancelled'] else '확보 완료'} · {result['days']}일 저장"
-                    if result['errors']: message+=f" · 확인 필요 {len(result['errors'])}건"
-                    self.status.set(message);self._log(message)
-                    for error in result['errors'][:5]: self._log(error)
-                else: self.status.set(event['message']); self._log(event['message'])
-                self._buttons()
-            elif kind=='catalog_progress':
-                self._update_product_stats();self.status.set(event['message']);self._log(event['message'])
-            elif kind=='snapshot': self._show_snapshot(event)
-            elif kind=='started': self._log('감시 시작 · '+date_label(event['config'].date))
-            elif kind=='finished':
-                if not self.status.get().startswith('NOL') and '로그인' not in self.status.get(): self.status.set('감시 종료 · 조건을 변경할 수 있습니다')
-                self._lock_conditions(False); self._buttons(); self._log(event['message'])
-            elif kind in ('auth','error'):
-                if kind=='auth': self.session_status.set('로그인 만료 · 전용 Edge에서 다시 로그인하세요')
-                self.status.set(event['message']); self._log(event['message'])
-            else: self._log(event.get('message',''))
+            self._event_persisted=event.get('_persisted',False)
+            try: self._handle_event(event)
+            finally: self._event_persisted=False
         self.poll_id=self.root.after(100,self._poll)
 
-    def _log(self,text):
-        text=sanitize(text); self.logger.info(text)
+    def _handle_event(self,event):
+        kind=event['kind']
+        if kind=='session_maintenance':
+            self._show_session_maintenance(event)
+        elif kind in ('loaded','tested','login_opened','session_saved','catalog_done','job_error'):
+            self.busy=False
+            if event.get('auth'): self.session_status.set('로그인 만료 · 전용 Edge에서 다시 로그인하세요')
+            if kind in ('catalog_done','job_error'): self.syncing=False
+            ticket=event.get('ticket')
+            if ticket is not None and not self.guard.accepts(ticket):
+                self._log('조건이 변경되어 이전 조회 결과를 제외했습니다. 다시 읽어주세요.',persist=True,event='STALE_RESULT')
+                self.status.set('조건 변경 · 회차 새로고침 필요')
+            elif kind=='loaded': self._show_loaded(event['value'])
+            elif kind=='tested': self._log('텔레그램 테스트 알림 전송 완료')
+            elif kind=='login_opened':
+                if event['value']:
+                    self.status.set('기존 로그인으로 연결 완료 · 목록 읽기 또는 감시 시작이 가능합니다')
+                    self.session_status.set('로그인 유지 확인 · 세션 자동 저장 완료')
+                    self._log('기존 로그인 재사용 완료 · 다시 로그인할 필요가 없습니다')
+                else:
+                    self.status.set('전용 Edge 로그인 후 로그인 세션 저장을 누르세요')
+                    self.session_status.set('로그인 필요 · 전용 Edge에서 로그인 후 세션 저장하세요')
+                    self._log('로그인 브라우저 준비 완료 · 로그인 후 세션 저장 필요')
+            elif kind=='session_saved':
+                self.status.set('로그인 세션 저장 완료 · 브라우저 연결·목록 읽기를 누르세요')
+                self.session_status.set('세션 저장 완료 · '+dt.datetime.now().strftime('%H:%M:%S'))
+                self._log(f"로그인 확인 · 세션 쿠키 {event['value']}개 저장 · session_cookies.json")
+            elif kind=='catalog_done':
+                result=event['value'];self._cached_view()
+                message=f"목록 {'확보 중지' if result['cancelled'] else '확보 완료'} · {result['days']}일 저장"
+                if result['errors']: message+=f" · 확인 필요 {len(result['errors'])}건"
+                self.status.set(message);self._log(message)
+                for error in result['errors'][:5]: self._log(error)
+            else: self.status.set(event['message']); self._log(event['message'])
+            self._buttons()
+        elif kind=='catalog_progress':
+            self._update_product_stats();self.status.set(event['message']);self._log(event['message'])
+        elif kind=='snapshot': self._show_snapshot(event)
+        elif kind=='started': self._log('감시 시작 · '+date_label(event['config'].date))
+        elif kind=='finished':
+            if not self.status.get().startswith('NOL') and '로그인' not in self.status.get(): self.status.set('감시 종료 · 조건을 변경할 수 있습니다')
+            self._lock_conditions(False); self._buttons(); self._log(event['message'])
+        elif kind in ('auth','error'):
+            if kind=='auth': self.session_status.set('로그인 만료 · 전용 Edge에서 다시 로그인하세요')
+            self.status.set(event['message']); self._log(event['message'])
+        else: self._log(event.get('message',''))
+
+    def _log(self,text,*,persist=None,level=logging.INFO,event='GUI_MESSAGE'):
+        text=sanitize(text)
+        if persist is None: persist=not self._event_persisted
+        if persist: self.logger.log(level,text,extra={'event':event})
         stamp=dt.datetime.now().strftime('%H:%M:%S')
         for view in (self.home_log_text,self.log_text):
             at_bottom=not view.winfo_ismapped() or view.yview()[1]>=0.99
@@ -521,7 +606,7 @@ class App:
             view.configure(state='disabled')
 
     def _problem(self,error):
-        self._log(error); messagebox.showerror('화담숲 모니터',sanitize(error),parent=self.root)
+        self._log(error,level=logging.ERROR,event='GUI_ERROR'); messagebox.showerror('화담숲 모니터',sanitize(error),parent=self.root)
 
     def _open_product(self):
         try: url=self._session_url()
@@ -530,11 +615,30 @@ class App:
 
     def close(self):
         if self.closed: return
+        self.logger.info('프로그램 종료 요청 · 감시/목록 작업 중지',extra={'event':'APP_CLOSING'})
         self.closed=True; self.runner.stop();self.catalog_stop.set(); self.root.after_cancel(self.poll_id)
+        self.root.after_cancel(self.keepalive_id)
         self._remember()
         try: atomic_write(self.choices_file,json.dumps(self.choices,ensure_ascii=False,indent=2))
-        except OSError: pass
+        except OSError as error:
+            self.logger.error('종료 시 선택 저장 실패 · '+sanitize(error),extra={'event':'SETTINGS_SAVE_FAILED'})
         self.executor.shutdown(wait=False,cancel_futures=True)
-        threading.Thread(target=self.browser.detach,daemon=True).start()
-        self.logger.removeHandler(self.log_handler); self.log_handler.close()
         self.root.destroy()
+        with self.jobs_lock: pending=any(not future.done() for future in self.pending_jobs)
+        if pending or self.runner.running:
+            self.cleanup_thread=threading.Thread(target=self._finish_close,name='hwadam-cleanup',daemon=False)
+            self.cleanup_thread.start()
+        else: self._finish_close()
+
+    def _finish_close(self):
+        # 실행 중인 조회의 마지막 결과까지 보존하고, Tk 객체는 건드리지 않는다.
+        self.executor.shutdown(wait=True,cancel_futures=True)
+        if self.runner.thread: self.runner.thread.join(timeout=35)
+        if self.runner.running:
+            self.logger.warning('감시 종료 대기 35초 경과 · 마지막 조회가 끝날 때까지 기록 유지',extra={'event':'SHUTDOWN_WAITING'})
+            self.runner.thread.join()
+        try: self.browser.detach()
+        except Exception as error:
+            self.logger.warning('브라우저 분리 실패 · '+type(error).__name__,extra={'event':'BROWSER_DETACH_FAILED'})
+        self.logger.info('프로그램 종료 · 작업 정리 완료',extra={'event':'APP_CLOSED'})
+        self.log_handler.close()

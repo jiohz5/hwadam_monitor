@@ -126,7 +126,10 @@ def sync_catalogues(client,cache,stop,emit,*,products=PRODUCTS,delay=.25,today=N
                     total_days+=1
                 except AuthLost: raise
                 except ApiError as error:
-                    errors.append(f'{date} 입장권: '+sanitize(error));consecutive+=1
+                    message=f'{date} 입장권: '+sanitize(error)
+                    errors.append(message);consecutive+=1
+                    emit({'kind':'catalog_error','message':message,'phase':'entry',
+                          'date':date,'product_id':str(catalog.id)})
                     if consecutive>=3: raise ApiError('연속 조회 실패 · 확보한 목록은 저장되어 있습니다') from error
                     continue
                 if entry and sections:
@@ -138,7 +141,11 @@ def sync_catalogues(client,cache,stop,emit,*,products=PRODUCTS,delay=.25,today=N
                             rows=client.rounds(scoped,monorail=True,entry_time=parent)
                             cache.put_rounds(catalog.id,date,rows,section=section,parent_time=parent,ages=scoped.selected_ages)
                         except AuthLost: raise
-                        except ApiError as error: errors.append(f'{date} {section}: '+sanitize(error))
+                        except ApiError as error:
+                            message=f'{date} {section}: '+sanitize(error)
+                            errors.append(message)
+                            emit({'kind':'catalog_error','message':message,'phase':'monorail',
+                                  'date':date,'product_id':str(catalog.id),'section':section})
                 emit({'kind':'catalog_progress','message':f"{catalog.name} · {date} · {index+1}/{len(days)}일 저장",'pid':str(catalog.id)})
         return {'days':total_days,'errors':errors,'cancelled':False}
     except Cancelled:
