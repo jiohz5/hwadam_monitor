@@ -68,7 +68,7 @@ def event_records(event):
     elif kind == 'tested': add('TELEGRAM_TEST_SENT', '텔레그램 테스트 알림 전송 완료')
     elif kind == 'session_saved': add('SESSION_SAVED', f"로그인 확인 · 세션 쿠키 {event['value']}개 저장")
     elif kind == 'login_opened':
-        add('LOGIN_OPENED', '기존 로그인 재사용 완료' if event['value'] else '로그인 브라우저 준비 완료 · 로그인 후 세션 저장 필요')
+        add('LOGIN_OPENED', 'NOL 로그인 확인 · 세션 자동 저장 완료' if event['value'] else '자동 로그인 미완료 · 전용 Edge에서 로그인 후 세션 저장 필요')
     elif event.get('message'):
         add('CATALOG_PROGRESS' if kind == 'catalog_progress' else 'BROWSER' if kind == 'log' else 'APP', event['message'])
     return records

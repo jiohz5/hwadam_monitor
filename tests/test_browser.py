@@ -197,7 +197,8 @@ class SessionTests(unittest.TestCase):
             original=json.dumps([{'name':'analytics-only','value':'test-cookie',
                 'domain':'.yanolja.com','path':'/','expires':time.time()+3600}])
             session.cookie_file.write_text(original,encoding='utf-8')
-            self.assertIs(session.open_login(DEFAULT_URL),False)
+            with patch.object(session, '_try_kakao_login', return_value=False):
+                self.assertIs(session.open_login(DEFAULT_URL),False)
             self.assertTrue(session.driver.current_url.startswith('https://accounts.yanolja.com?'))
             self.assertEqual(session.cookie_file.read_text(encoding='utf-8'),original)
 

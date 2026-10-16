@@ -18,7 +18,8 @@ import zipfile
 from urllib.parse import quote, urlsplit
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchWindowException, StaleElementReferenceException, TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.service import Service
 from urllib3.exceptions import HTTPError
 
@@ -411,7 +412,7 @@ class BrowserSession:
             return len(cookies)
 
     def open_login(self,url):
-        """기존 로그인을 먼저 재사용하고, 필요할 때만 수동 로그인 화면을 연다."""
+        """기존 세션 또는 저장된 카카오 계정으로 로그인하고 확인된 세션을 저장한다."""
         validate_url(url)
         with self.lock,self._auth_attempt('open_login'):
             self._attach(url)
@@ -423,8 +424,113 @@ class BrowserSession:
                 self.log("기존 로그인 유지 확인 · NOL·간편로그인 세션 자동 저장 완료")
                 return True
             self._navigate('https://accounts.yanolja.com?service=yanolja&redirectUrl='+quote(url,safe=''))
+            if self._try_kakao_login(url):
+                self.save_session()
+                self.log('카카오 간편로그인 완료 · NOL·간편로그인 세션 자동 저장 완료')
+                return True
             self.log("전용 Edge에서 로그인 후 GUI의 '로그인 세션 저장'을 누르세요")
             return False
+
+    def _try_kakao_login(self,url,timeout=25):
+        """공식 로그인 화면의 기존 계정만 클릭한다. 새 인증·동의는 사용자에게 맡긴다."""
+        origin = self.tab
+        initial_handles = set(self.driver.window_handles)
+        active = origin
+        popup = None
+        started = selected = False
+        deadline = time.monotonic()+timeout
+        self._diag('KAKAO_LOGIN_BEGIN')
+        self.log('카카오 간편로그인 시도 · 저장된 계정 선택 대기')
+
+        def pending(reason,**metadata):
+            self.session_maintenance_blocked = True
+            self._diag('KAKAO_MANUAL_REQUIRED',reason=reason,**metadata)
+            messages = {
+                'multiple_accounts':'저장된 카카오 계정이 여러 개입니다. 사용할 계정을 직접 선택하세요',
+                'no_saved_account':'저장된 카카오 계정이 없습니다. 전용 Edge에서 로그인하세요',
+                'additional_auth':'비밀번호 또는 추가 인증이 필요합니다. 전용 Edge에서 이어서 진행하세요',
+                'login_not_confirmed':'카카오 선택 후 NOL 로그인이 확인되지 않았습니다',
+                'unexpected_page':'예상한 로그인 화면이 아닙니다. 전용 Edge 화면을 확인하세요',
+                'multiple_popups':'로그인 창이 여러 개 열렸습니다. 전용 Edge에서 사용할 창을 확인하세요',
+                'window_closed':'로그인 창이 닫혔습니다. 로그인 브라우저를 다시 열어주세요',
+                'click_failed':'카카오 로그인 버튼을 누르지 못했습니다. 전용 Edge 화면을 확인하세요',
+                'timeout':'카카오 자동 로그인 대기 시간이 지났습니다. 추가 인증·동의 또는 계정 선택 화면을 확인하세요',
+            }
+            self.log(messages[reason])
+            return False
+
+        def page():
+            parts = urlsplit(self.driver.current_url)
+            if parts.scheme!='https': return 'other'
+            return self._url_kind(self.driver.current_url)
+
+        def visible(by,selector):
+            return [element for element in self.driver.find_elements(by,selector) if element.is_displayed()]
+
+        def clickable(element):
+            return element.is_enabled() and element.get_attribute('aria-disabled')!='true'
+
+        while time.monotonic()<deadline:
+            try:
+                handles = self.driver.window_handles
+                if started and popup is None:
+                    candidates = []
+                    for handle in handles:
+                        if handle in initial_handles: continue
+                        self.driver.switch_to.window(handle)
+                        if page() in ('nol_account','kakao_account','kakao_oauth','product'):
+                            candidates.append(handle)
+                    if len(candidates)>1: return pending('multiple_popups')
+                    if candidates:
+                        popup = active = candidates[0]
+                if active not in handles:
+                    if origin not in handles: return pending('window_closed')
+                    active = origin
+                if selected and popup is not None and origin in handles and active!=origin:
+                    # 일부 OAuth 흐름은 팝업을 닫지 않고 원래 탭만 상품으로 돌려놓는다.
+                    self.driver.switch_to.window(origin)
+                    if page()=='product': active = origin
+                self.driver.switch_to.window(active)
+                kind = page()
+                if kind=='product':
+                    self.tab = active
+                    # 클릭·리디렉션만으로 성공을 판단하지 않고 상품의 실제 인증을 확인한다.
+                    if self.driver.current_url!=url:
+                        self._navigate(url)
+                    if not self._logged_in(): return pending('login_not_confirmed')
+                    self._diag('KAKAO_LOGIN_READY')
+                    return True
+                if kind not in ('nol_account','kakao_account','kakao_oauth','nol_service'):
+                    return pending('unexpected_page')
+                if kind in ('nol_account','kakao_account'):
+                    if visible(By.CSS_SELECTOR,"input[type='password'], input[autocomplete='one-time-code']"):
+                        return pending('additional_auth')
+                if kind=='nol_account' and not started:
+                    buttons = visible(By.XPATH,"//button[contains(normalize-space(.), '카카오로 시작하기')]")
+                    if len(buttons)==1 and clickable(buttons[0]):
+                        buttons[0].click()
+                        started = True
+                        self._diag('KAKAO_START_CLICKED')
+                        self.log('카카오로 시작하기 클릭 완료')
+                elif kind=='kakao_account' and not selected:
+                    # 새로운 계정·계정 삭제 버튼과 구분되는 실제 저장 계정의 프로필만 선택한다.
+                    accounts = [element for element in visible(By.CSS_SELECTOR,"a.wrap_profile[role='button']")
+                                if element.find_elements(By.CSS_SELECTOR,'.info_profile')]
+                    if len(accounts)>1: return pending('multiple_accounts',accounts=len(accounts))
+                    if len(accounts)==1 and clickable(accounts[0]):
+                        accounts[0].click()
+                        selected = True
+                        self._diag('KAKAO_ACCOUNT_CLICKED',accounts=1)
+                        self.log('저장된 카카오 계정 선택 완료 · NOL 로그인 확인 중')
+                    elif not accounts and visible(By.XPATH,"//h2[normalize-space(.)='로그인할 카카오계정 선택']"):
+                        return pending('no_saved_account')
+            except (StaleElementReferenceException,NoSuchWindowException):
+                # 리디렉션으로 요소·팝업이 사라졌다면 다음 상태에서 다시 판정한다.
+                pass
+            except (WebDriverException,HTTPError,OSError) as error:
+                return pending('click_failed',error_type=type(error).__name__)
+            time.sleep(.2)
+        return pending('timeout')
 
     def save_login_session(self,url):
         """현재 브라우저 로그인을 새 상품 응답으로 확인한 뒤 저장한다."""

@@ -477,8 +477,9 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
 
     날짜·수량은 사용자가 브라우저에서 먼저 설정한다. 최종 결제는 지원하지 않는다.
     """
+    # stop_before_pay=False 이면 실제 결제까지 진행 (감시 자동 예약용)
     if not stop_before_pay:
-        raise BookingTestError('예약 테스트에서는 최종 결제를 실행할 수 없습니다')
+        pass  # 실제 결제 허용
 
     def checkpoint():
         if should_stop is not None and should_stop():
@@ -1110,6 +1111,58 @@ class OperationsUI:
         app._submit(job,'test_pay_done')
         # 테스트 끝난 뒤 30초간 keepalive가 페이지를 건드리지 못하게 함
         app.root.after(30000, lambda: setattr(app, 'test_booking_hold', False))
+    def _start_auto_booking(self, snapshot=None):
+        """감시 중 가용 발견 시 자동으로 예약(결제) 시도."""
+        if self.closed or self.busy or self.runner.running is False:
+            return
+        try:
+            config = self.read_config()
+            if config.mode != 'entry':
+                self._log('자동 예약은 입장권 모드만 지원'); return
+        except Exception as e:
+            self._log('자동 예약 설정 오류 · ' + str(e)); return
+
+        age_label = AGE_NAMES.get(config.selected_ages[0], '성인') if config.selected_ages else '성인'
+        self.test_booking_hold = True
+        self._log(f'[AUTO-BOOKING] 가용 발견 · {age_label} 예약 시도')
+        self._lock_conditions(True)
+
+        def job():
+            browser = self.browser
+            try:
+                with self.client.lock, browser.lock:
+                    if self.closed:
+                        raise BookingTestError('종료 요청')
+                    if browser.driver is None:
+                        raise BookingTestError('브라우저 미연결')
+                    browser._select()
+                    return run_test_booking(
+                        browser.driver, config,
+                        age_label=age_label,
+                        stop_before_pay=False,  # 실제 결제까지
+                        should_stop=lambda: self.closed,
+                        log=lambda m: self._emit({'kind': 'log', 'message': m})
+                    )
+            except BookingTestError as e:
+                self._emit({'kind': 'log', 'message': f'[AUTO-BOOKING] 실패 · {e}'})
+                return False
+            except Exception as e:
+                self._emit({'kind': 'log', 'message': f'[AUTO-BOOKING] 오류 · {type(e).__name__}'})
+                return False
+            finally:
+                # 결제 후 상품 페이지로 복귀 시도
+                try:
+                    if browser.driver:
+                        browser.driver.get(config.url)
+                        self._emit({'kind': 'log', 'message': '[AUTO-BOOKING] 상품 페이지 복귀'})
+                except Exception:
+                    pass
+                self.test_booking_hold = False
+                self._emit({'kind': 'log', 'message': '[AUTO-BOOKING] 완료 · 감시 계속'})
+
+        self._submit(job, 'auto_booking_done')
+
+
 
     def start_preview(self):
         if not self.admin_enabled or self.rehearsing or self.app.busy or self.app.runner.running: return
@@ -1734,13 +1787,13 @@ class App:
             elif kind=='test_pay_done': self._log('브라우저 예약 테스트 완료 · 최종 결제 미실행')
             elif kind=='login_opened':
                 if event['value']:
-                    self.status.set('기존 로그인으로 연결 완료 · 목록 읽기 또는 감시 시작이 가능합니다')
-                    self.session_status.set('로그인 유지 확인 · 세션 자동 저장 완료')
-                    self._log('기존 로그인 재사용 완료 · 다시 로그인할 필요가 없습니다')
+                    self.status.set('로그인 연결 완료 · 목록 읽기 또는 감시 시작이 가능합니다')
+                    self.session_status.set('로그인 확인 · 세션 자동 저장 완료')
+                    self._log('NOL 로그인 확인 · 세션 자동 저장 완료')
                 else:
                     self.status.set('전용 Edge 로그인 후 로그인 세션 저장을 누르세요')
                     self.session_status.set('로그인 필요 · 전용 Edge에서 로그인 후 세션 저장하세요')
-                    self._log('로그인 브라우저 준비 완료 · 로그인 후 세션 저장 필요')
+                    self._log('자동 로그인 미완료 · 위 안내에 따라 전용 Edge에서 로그인 후 세션을 저장하세요')
             elif kind=='session_saved':
                 self.status.set('로그인 세션 저장 완료 · 브라우저 연결·목록 읽기를 누르세요')
                 self.session_status.set('세션 저장 완료 · '+dt.datetime.now().strftime('%H:%M:%S'))
@@ -1758,8 +1811,9 @@ class App:
         elif kind=='snapshot': self._show_snapshot(event)
         elif kind=='booking_attempt':
             self._log(event.get('message','가용 회차 발견 · 예약 시도'))
-            # TODO: 여기서 run_test_booking을 호출하거나 별도 스레드로 예약 실행
-            # 수량 미달 시 감시 루프는 이 파일의 MonitorRunner에서 계속 처리됨
+            # 가용 발견 시 실제 결제 시도 (백그라운드)
+            if not self.busy and not getattr(self, 'test_booking_hold', False):
+                self._start_auto_booking(event.get('snapshot'))
         elif kind=='started': self._log('감시 시작 · '+date_label(event['config'].date))
         elif kind=='finished':
             if not self.status.get().startswith('NOL') and '로그인' not in self.status.get(): self.status.set('감시 종료 · 조건을 변경할 수 있습니다')

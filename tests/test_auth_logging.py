@@ -128,7 +128,8 @@ class AuthLoggingTests(unittest.TestCase):
                 session, logs = self.make_session(folder, LoginDriver())
                 session.cookie_file.write_text(original, encoding="utf-8")
 
-                self.assertIs(session.open_login(DEFAULT_URL), False)
+                with patch.object(session, '_try_kakao_login', return_value=False):
+                    self.assertIs(session.open_login(DEFAULT_URL), False)
 
                 self.assertEqual(session.cookie_file.read_text(encoding="utf-8"), original)
                 self.event(logs, "COOKIE_FILE_INVALID", source="saved")
@@ -216,7 +217,8 @@ class AuthLoggingTests(unittest.TestCase):
                     'domain':'.yanolja.com','path':'/','expires':expiry}])
                 session.cookie_file.write_text(original, encoding='utf-8')
                 try:
-                    result = session.open_login(DEFAULT_URL)
+                    with patch.object(session, '_try_kakao_login', return_value=False):
+                        result = session.open_login(DEFAULT_URL)
                 except Exception as error:
                     self.fail('잘못된 쿠키 만료 정보가 진단·복원 흐름을 중단함: '+type(error).__name__)
                 self.assertIs(result, False)
