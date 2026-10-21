@@ -3,6 +3,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from unittest.mock import patch
 
 from gui import App
 from test_browser import LoginDriver
@@ -49,8 +50,9 @@ class GuiSessionKeeperTests(unittest.TestCase):
                 app.browser.driver = LoginDriver(logged=False)
                 app.browser.tab = 'own-tab'
                 app.browser.cookie_file.write_text('[]', encoding='utf-8')
-                app._keep_session_alive()
-                self._finish_job(root, app)
+                with patch.object(app.browser, '_try_kakao_login', return_value=False):
+                    app._keep_session_alive()
+                    self._finish_job(root, app)
                 self.assertEqual(app.browser.cookie_file.read_text(encoding='utf-8'), '[]')
                 self.assertIn('다시 로그인', app.session_status.get())
                 self.assertIn('로그인 유지 실패', app.home_log_text.get('1.0', 'end'))

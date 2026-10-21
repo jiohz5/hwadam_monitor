@@ -218,7 +218,8 @@ class SessionKeepaliveTests(unittest.TestCase):
         self.session.cookie_file.write_text(original, encoding='utf-8')
         self.driver.allow_auth = False
         self.driver.logged = False
-        with self.assertRaises(LoginRequired):
+        with patch.object(self.session, '_try_kakao_login', return_value=False), \
+             self.assertRaises(LoginRequired):
             self.maintain()
         self.assertEqual(self.session.cookie_file.read_text(encoding='utf-8'), original)
         visited = list(self.driver.visited)

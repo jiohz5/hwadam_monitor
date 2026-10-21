@@ -2,7 +2,7 @@
 import logging
 
 from catalog import product_id
-from gui import AGE_NAMES, count_label, date_label
+from gui import AGE_NAMES, BookingResult, booking_result_message, count_label, date_label
 
 
 def watch_summary(config):
@@ -64,7 +64,12 @@ def event_records(event):
     elif kind == 'catalog_done':
         value = event['value']
         add('CATALOG_DONE', f"목록 {'확보 중지' if value['cancelled'] else '확보 완료'} · {value['days']}일 저장 · 확인 필요 {len(value['errors'])}건")
-    elif kind == 'test_pay_done': add('BOOKING_TEST_DONE', '브라우저 예약 테스트 완료 · 최종 결제 미실행')
+    elif kind == 'test_pay_done':
+        result=event.get('value')
+        status=result.status if isinstance(result,BookingResult) else ''
+        code={'confirmed':'BOOKING_CONFIRMED','unconfirmed':'BOOKING_RESULT_UNCONFIRMED'}.get(status,'BOOKING_TEST_DONE')
+        add(code,booking_result_message(result),logging.WARNING if status=='unconfirmed' else logging.INFO)
+    elif kind == 'test_pay_cancelled': add('BOOKING_TEST_CANCELLED', '브라우저 테스트 중지 완료')
     elif kind == 'tested': add('TELEGRAM_TEST_SENT', '텔레그램 테스트 알림 전송 완료')
     elif kind == 'session_saved': add('SESSION_SAVED', f"로그인 확인 · 세션 쿠키 {event['value']}개 저장")
     elif kind == 'login_opened':

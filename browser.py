@@ -419,36 +419,101 @@ class BrowserSession:
             self._select()
             self.headers = {}
             self.ready_url = None
-            if self._recover_login(url):
+            if self._ensure_login(url,manual=True):
                 self.save_session()
-                self.log("기존 로그인 유지 확인 · NOL·간편로그인 세션 자동 저장 완료")
-                return True
-            self._navigate('https://accounts.yanolja.com?service=yanolja&redirectUrl='+quote(url,safe=''))
-            if self._try_kakao_login(url):
-                self.save_session()
-                self.log('카카오 간편로그인 완료 · NOL·간편로그인 세션 자동 저장 완료')
+                self.log('NOL 로그인 확인 · NOL·간편로그인 세션 자동 저장 완료')
                 return True
             self.log("전용 Edge에서 로그인 후 GUI의 '로그인 세션 저장'을 누르세요")
             return False
 
+    def _try_kakao_password_autofill(self,password,timeout,*,preserve_guard=False):
+        """성공하면 None, 실패하면 원인 flag. 비밀번호 값은 브라우저 밖으로 읽지 않는다."""
+        deadline = time.monotonic()+timeout
+        try:
+            # 아이디 비교는 페이지 안에서만 수행한다. 다른 저장 계정으로 바뀌면 제출하지 않는다.
+            identified = self.driver.execute_script("""
+                const field = arguments[0];
+                const account = (field.form || document).querySelector(
+                    'input[name="loginId"], input[autocomplete="username"], input[type="email"], input[type="text"]');
+                const original = account?.value;
+                field.__hcKakaoAccountUnchanged = () => Boolean(
+                    account?.isConnected && original?.trim() && account.value === original);
+                return field.__hcKakaoAccountUnchanged();
+            """,password)
+            if identified is not True: return 'autofill_account_missing'
+            self.driver.execute_cdp_cmd('Page.bringToFront',{})
+            password.click()
+            self._diag('KAKAO_PASSWORD_FOCUSED')
+            self.log('카카오 비밀번호 칸 클릭 · Edge 저장 암호 선택 대기')
+
+            def filled():
+                return self.driver.execute_script('return Boolean(arguments[0].value);',password) is True
+
+            def ready(source):
+                unchanged = self.driver.execute_script(
+                    'return Boolean(arguments[0].__hcKakaoAccountUnchanged?.());',password)
+                if unchanged is not True: return 'autofill_account_changed'
+                self._diag('KAKAO_AUTOFILL_READY',source=source)
+                self.log('저장 암호 입력 확인 · 로그인 상태 유지 확인 중')
+                return None
+
+            if filled():
+                return ready('already_filled')
+            # 팝업 생성 직후의 오입력 방지 시간이 지난 뒤 첫 항목을 선택한다.
+            time.sleep(min(.8,max(0,deadline-time.monotonic())))
+            if not filled() and time.monotonic()<deadline:
+                # WebDriver send_keys는 nativeVirtualKeyCode가 없어 브라우저 팝업의
+                # 키 리스너를 건너뛴다. PageUp은 첫 항목 선택, Tab은 선택 확정이며
+                # 팝업이 없을 때도 폼을 제출하지 않는다. 전역 Windows 입력은 쓰지 않는다.
+                for key,code in (('PageUp',33),('Tab',9)):
+                    for event in ('rawKeyDown','keyUp'):
+                        self.driver.execute_cdp_cmd('Input.dispatchKeyEvent',{
+                            'type':event,'key':key,'code':key,
+                            'windowsVirtualKeyCode':code,'nativeVirtualKeyCode':code})
+                self._diag('KAKAO_AUTOFILL_SELECTION_ATTEMPTED')
+            while time.monotonic()<deadline:
+                if filled(): return ready('browser')
+                time.sleep(.1)
+            self._diag('KAKAO_AUTOFILL_UNAVAILABLE')
+            return 'autofill_unavailable'
+        finally:
+            if not preserve_guard:
+                self._clear_kakao_password_guard(password)
+
+    def _clear_kakao_password_guard(self,password):
+        if password is None: return
+        try:
+            self.driver.execute_script('delete arguments[0].__hcKakaoAccountUnchanged;',password)
+        except (WebDriverException,HTTPError,OSError):
+            pass  # 이동·창 종료로 사라진 페이지의 임시 비교 함수는 함께 폐기된다.
+
     def _try_kakao_login(self,url,timeout=25):
-        """공식 로그인 화면의 기존 계정만 클릭한다. 새 인증·동의는 사용자에게 맡긴다."""
+        """기존 계정과 Edge 저장 암호로만 로그인한다. 추가 인증은 사용자에게 맡긴다."""
         origin = self.tab
         initial_handles = set(self.driver.window_handles)
         active = origin
         popup = None
-        started = selected = False
+        started = selected = password_attempted = submitted = False
+        password_ready = False
+        password_guard = None
         deadline = time.monotonic()+timeout
         self._diag('KAKAO_LOGIN_BEGIN')
         self.log('카카오 간편로그인 시도 · 저장된 계정 선택 대기')
 
         def pending(reason,**metadata):
+            self._clear_kakao_password_guard(password_guard)
             self.session_maintenance_blocked = True
             self._diag('KAKAO_MANUAL_REQUIRED',reason=reason,**metadata)
             messages = {
                 'multiple_accounts':'저장된 카카오 계정이 여러 개입니다. 사용할 계정을 직접 선택하세요',
                 'no_saved_account':'저장된 카카오 계정이 없습니다. 전용 Edge에서 로그인하세요',
-                'additional_auth':'비밀번호 또는 추가 인증이 필요합니다. 전용 Edge에서 이어서 진행하세요',
+                'additional_auth':'추가 인증이 필요합니다. 전용 Edge에서 이어서 진행하세요',
+                'autofill_unavailable':'저장 암호가 입력되지 않았습니다. Edge 암호 목록 또는 Windows 인증 창을 확인하세요',
+                'autofill_account_missing':'자동완성할 카카오 아이디가 확인되지 않았습니다. 사용할 계정을 직접 선택하세요',
+                'autofill_account_changed':'저장 암호 선택 중 카카오 아이디가 달라져 제출하지 않았습니다. 사용할 계정을 확인하세요',
+                'ambiguous_password':'비밀번호 입력칸을 하나로 확인하지 못했습니다. 카카오 화면을 확인하세요',
+                'keep_not_checked':'로그인 상태 유지 체크를 확인하지 못했습니다. 카카오 화면을 확인하세요',
+                'submit_unavailable':'카카오 로그인 버튼을 하나로 확인하지 못했습니다. 카카오 화면을 확인하세요',
                 'login_not_confirmed':'카카오 선택 후 NOL 로그인이 확인되지 않았습니다',
                 'unexpected_page':'예상한 로그인 화면이 아닙니다. 전용 Edge 화면을 확인하세요',
                 'multiple_popups':'로그인 창이 여러 개 열렸습니다. 전용 Edge에서 사용할 창을 확인하세요',
@@ -498,13 +563,54 @@ class BrowserSession:
                     if self.driver.current_url!=url:
                         self._navigate(url)
                     if not self._logged_in(): return pending('login_not_confirmed')
+                    self._clear_kakao_password_guard(password_guard)
                     self._diag('KAKAO_LOGIN_READY')
                     return True
                 if kind not in ('nol_account','kakao_account','kakao_oauth','nol_service'):
                     return pending('unexpected_page')
                 if kind in ('nol_account','kakao_account'):
-                    if visible(By.CSS_SELECTOR,"input[type='password'], input[autocomplete='one-time-code']"):
+                    if visible(By.CSS_SELECTOR,"input[autocomplete='one-time-code']"):
                         return pending('additional_auth')
+                    passwords = visible(By.CSS_SELECTOR,"input[type='password']")
+                    if passwords and not submitted:
+                        if kind!='kakao_account': return pending('additional_auth')
+                        if len(passwords)!=1 or not clickable(passwords[0]):
+                            return pending('ambiguous_password')
+                        if not password_ready:
+                            if password_attempted: return pending('autofill_unavailable')
+                            password_attempted = True
+                            selected = True
+                            password_guard = passwords[0]
+                            reason = self._try_kakao_password_autofill(
+                                passwords[0],min(5,max(0,deadline-time.monotonic())),preserve_guard=True)
+                            if reason: return pending(reason)
+                            password_ready = True
+                        # 자동완성 도중 리디렉션되었다면 다른 페이지의 버튼을 누르지 않는다.
+                        if page()!='kakao_account': continue
+                        if self.driver.execute_script(
+                            'return Boolean(arguments[0].value && arguments[0].__hcKakaoAccountUnchanged?.());',
+                            passwords[0]) is not True:
+                            return pending('autofill_account_changed')
+                        keep = visible(By.CSS_SELECTOR,"input[type='checkbox'][name='staySignedIn']")
+                        if len(keep)!=1: return pending('keep_not_checked')
+                        if not keep[0].is_selected():
+                            if not clickable(keep[0]): return pending('keep_not_checked')
+                            labels = visible(By.CSS_SELECTOR,'label#label-staySignedIn')
+                            (labels[0] if len(labels)==1 else keep[0]).click()
+                        if not keep[0].is_selected(): return pending('keep_not_checked')
+                        self._diag('KAKAO_KEEP_SIGNED_IN',checked=1)
+                        buttons = visible(By.XPATH,"//button[@type='submit' and normalize-space(.)='로그인']")
+                        if len(buttons)!=1 or not clickable(buttons[0]): return pending('submit_unavailable')
+                        # 응답 지연이나 창 전환 중에도 로그인 제출은 한 번만 한다.
+                        submitted = True
+                        try:
+                            buttons[0].click()
+                        except StaleElementReferenceException:
+                            # 클릭 전 교체된 요소로 거절된 경우만 새 버튼으로 재시도한다.
+                            submitted = False
+                            raise
+                        self._diag('KAKAO_LOGIN_SUBMITTED')
+                        self.log('로그인 상태 유지 체크 확인 · 카카오 로그인 제출 완료')
                 if kind=='nol_account' and not started:
                     buttons = visible(By.XPATH,"//button[contains(normalize-space(.), '카카오로 시작하기')]")
                     if len(buttons)==1 and clickable(buttons[0]):
@@ -530,7 +636,7 @@ class BrowserSession:
             except (WebDriverException,HTTPError,OSError) as error:
                 return pending('click_failed',error_type=type(error).__name__)
             time.sleep(.2)
-        return pending('timeout')
+        return pending('login_not_confirmed' if submitted else 'timeout')
 
     def save_login_session(self,url):
         """현재 브라우저 로그인을 새 상품 응답으로 확인한 뒤 저장한다."""
@@ -595,7 +701,7 @@ class BrowserSession:
                 # 계정·상품 이동으로 이전 조회 헤더가 낡을 수 있어 다음 조회에서 다시 확보한다.
                 self.headers = {}
                 self.ready_url = None
-                if not self._recover_login(url):
+                if not self._ensure_login(url):
                     raise LoginRequired('자동 로그인 유지로 인증을 복원하지 못했습니다. 전용 Edge에서 다시 로그인한 뒤 로그인 세션을 저장하세요')
                 self.save_session()
                 cookies = self.driver.execute_cdp_cmd('Network.getAllCookies',{}).get('cookies',[])
@@ -643,6 +749,21 @@ class BrowserSession:
         self.session_maintenance_blocked = True
         return False
 
+    def _ensure_login(self,url,*,manual=False):
+        """세 진입점에서 쿠키 복원 후 같은 카카오 복구를 최대 한 번 사용한다."""
+        was_blocked = self.session_maintenance_blocked
+        if self._recover_login(url): return True
+        if was_blocked and not manual:
+            self._diag('KAKAO_RECOVERY_SKIPPED',reason='manual_action_pending')
+            return False
+        self._diag('KAKAO_RECOVERY_BEGIN',trigger='manual' if manual else 'session_expired')
+        self._navigate('https://accounts.yanolja.com?service=yanolja&redirectUrl='+quote(url,safe=''))
+        if self._try_kakao_login(url):
+            self._session_verified()
+            return True
+        self.session_maintenance_blocked = True
+        return False
+
     def connect(self,url, *, force=False):
         validate_url(url)
         with self.lock:
@@ -659,7 +780,7 @@ class BrowserSession:
                     self._begin_auth(trigger)
                 self.headers = {}
                 self.ready_url = None
-                if not self._recover_login(url):
+                if not self._ensure_login(url):
                     raise LoginRequired('NOL 세션 갱신과 저장 세션 복원으로 로그인을 확인하지 못했습니다. 전용 Edge에서 로그인 후 세션을 저장하고 감시를 다시 시작하세요')
                 self.driver.execute_script(HOOK_JS)
                 deadline = time.monotonic()+16

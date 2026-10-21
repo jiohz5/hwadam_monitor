@@ -247,7 +247,9 @@ class SessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             session=BrowserSession(Path(folder));session.driver=CookieDriver(logged=False);session.tab='own-tab'
             session.cookie_file.write_text('[{"saved":"keep"}]',encoding='utf-8')
-            with self.assertRaises(LoginRequired): session.connect(DEFAULT_URL)
+            with patch.object(session, '_try_kakao_login', return_value=False), \
+                 self.assertRaises(LoginRequired):
+                session.connect(DEFAULT_URL)
             self.assertEqual(json.loads(session.cookie_file.read_text(encoding='utf-8')),[{'saved':'keep'}])
 
     def test_driver_connection_reset_is_recoverable_api_error(self):

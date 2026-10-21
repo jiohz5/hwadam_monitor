@@ -12,6 +12,7 @@ from selenium.webdriver.common.by import By
 
 import gui
 from gui import AGE_NAMES, DEFAULT_URL, WatchConfig
+from test_booking_selection import SelectionClock, SelectionDriver
 
 
 class BookingElement:
@@ -79,6 +80,9 @@ class BookingDriver:
         self.has_agree = True
         self.actions = []
         self.service = Mock()
+        self.selection = SelectionDriver(SelectionClock())
+        self.selection.selected['date'] = WatchConfig().date
+        self.selection.expanded = None
 
     def open_payment_tab(self):
         self.window_handles.append('payment-tab')
@@ -86,6 +90,9 @@ class BookingDriver:
 
     def find_elements(self, by, selector):
         self.actions.append(('find', by, selector))
+        selected = self.selection.find_elements(by, selector)
+        if selected:
+            return selected
         # Never expose a PIN screen: the fake flow must stop before settings are read.
         if '#mtk_pinCodeInput' in selector:
             return []
@@ -167,8 +174,8 @@ class BookingFlowTests(PatchedTestCase):
 
     def test_ready_checkout_never_clicks_final_payment(self):
         self.assertTrue(self.run_booking())
-        self.assertEqual(self.driver.time.clicks, 1)
-        self.assertEqual(self.driver.age.clicks, 1)
+        self.assertEqual(self.driver.selection.clicks['option:time'], 1)
+        self.assertEqual(self.driver.selection.clicks['option:age'], 1)
         self.assertEqual(self.driver.buy.clicks, 1)
         self.assertEqual(self.driver.money.clicks, 1)
         self.assertTrue(self.driver.agree.selected)

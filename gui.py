@@ -29,7 +29,9 @@ from typing import Callable
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import StaleElementReferenceException,  TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import (StaleElementReferenceException, TimeoutException,
+                                        ElementClickInterceptedException, ElementNotInteractableException,
+                                        NoSuchWindowException, WebDriverException)
 
 
 # === 1. 감시 모델·재고 판정 ===
@@ -408,12 +410,14 @@ class MonitorRunner:
     def _run(self,config,notifier,stop):
         from api import AuthLost, Cancelled
         from storage import sanitize
+        def event(kind,**values):
+            self._event(kind,monitor_stop=stop,**values)
         tracker=AlertTracker()
         failures=0
         checks=0
         reason='user_stop'
         try:
-            self._event('started',config=config)
+            event('started',config=config)
             while not stop.is_set():
                 delay=config.interval
                 phase='check'
@@ -421,44 +425,44 @@ class MonitorRunner:
                     result=self.client.check(config,stop)
                     if stop.is_set(): break
                     checks+=1
-                    self._event('snapshot',snapshot=result,checks=checks)
+                    event('snapshot',snapshot=result,checks=checks)
                     if tracker.pending(result):
                         if stop.is_set(): break
                         phase='telegram'
                         notifier.send(format_alert(result))
                         tracker.ack(result)
-                        self._event('sent',message='가용 회차 텔레그램 알림 전송 완료',snapshot=result,hits=len(result.hits))
+                        event('sent',message='가용 회차 텔레그램 알림 전송 완료',snapshot=result,hits=len(result.hits))
                         # 즉시 예약 시도
-                        self._event('booking_attempt',message='가용 회차 발견 · 예약 시도',snapshot=result)
+                        event('booking_attempt',message='가용 회차 발견 · 예약 시도',snapshot=result)
                         try:
                             # GUI 쪽에서 브라우저 예약 로직을 실행하도록 이벤트만 발생
                             # 실제 예약은 gui.py의 run_test_booking을 호출하는 핸들러에서 처리
                             pass
                         except Exception as be:
-                            self._event('error',message='예약 시도 중 오류 · '+sanitize(be),phase='booking')
+                            event('error',message='예약 시도 중 오류 · '+sanitize(be),phase='booking')
                         # 수량 미달이면 계속 감시 (루프 유지)
-                        self._event('log',message='예약 시도 후 감시 계속 (수량 미달 시 재시작)')
+                        event('log',message='예약 시도 후 감시 계속 (수량 미달 시 재시작)')
                     failures=0
                 except Cancelled:
                     reason='user_stop' if stop.is_set() else 'cancelled'
                     break
                 except AuthLost as problem:
                     reason='auth_lost'
-                    self._event('auth',message=sanitize(problem),phase=phase,failures=failures+1,retry_seconds=0)
+                    event('auth',message=sanitize(problem),phase=phase,failures=failures+1,retry_seconds=0)
                     if not stop.is_set():
                         try:
                             notifier.send('화담숲 감시가 중지되었습니다. NOL 로그인 후 다시 시작하세요.\n'+date_label(config.date))
                         except Exception as error:
-                            self._event('error',message=sanitize(error),phase='telegram',failures=1,retry_seconds=0)
+                            event('error',message=sanitize(error),phase='telegram',failures=1,retry_seconds=0)
                     break
                 except Exception as problem:
                     failures+=1
                     delay=min(300,max(config.interval,10)*(2**min(failures-1,4)))
-                    self._event('error',message=sanitize(problem)+f' · {delay:g}초 후 재시도',
+                    event('error',message=sanitize(problem)+f' · {delay:g}초 후 재시도',
                                 phase=phase,failures=failures,retry_seconds=delay)
                 stop.wait(delay)
         finally:
-            self._event('finished',message='감시 종료',reason=reason,checks=checks)
+            event('finished',message='감시 종료',reason=reason,checks=checks)
 
 
 # === 3. 브라우저 예약 테스트 ===
@@ -470,20 +474,324 @@ class BookingTestError(RuntimeError):
     pass
 
 
+class BookingCancelled(BookingTestError):
+    """중지 요청을 실행 실패와 구분한다."""
+
+
+@dataclass(frozen=True)
+class BookingResult:
+    status: str
+
+
+def booking_result_message(result):
+    if isinstance(result,BookingResult):
+        if result.status=='confirmed': return '예약 성공 · 예약 완료 확인'
+        if result.status=='unconfirmed': return '결제 결과 확인 필요 · 예약 완료 화면을 확인하지 못했습니다'
+    return '브라우저 테스트 완료 · 결과는 브라우저에서 확인하세요'
+
+
+def _wait_booking_confirmation(driver, original_window, payment_window=None, *,
+                               step=print, checkpoint=lambda: None, timeout=20):
+    """이번 예약의 창만 확인한다. 결제창 종료는 실패나 성공의 근거가 아니다."""
+    candidates = tuple(dict.fromkeys(handle for handle in (original_window,payment_window) if handle))
+    deadline = time.monotonic()+timeout
+    previous_hint = None
+    while True:
+        checkpoint()
+        hint = '예약 완료 페이지 전환 대기'
+        try:
+            handles = set(driver.window_handles)
+            checkpoint()
+            if payment_window and payment_window not in handles:
+                hint = '결제창 종료 감지 · 원래 예약창에서 완료 확인 중'
+            if not any(handle in handles for handle in candidates):
+                hint = '확인 가능한 예약창 없음 · 창 전환 대기'
+            for handle in candidates:
+                if handle not in handles: continue
+                checkpoint()
+                try:
+                    driver.switch_to.window(handle)
+                    checkpoint()
+                    url = urlsplit(driver.current_url or '')
+                    if (url.scheme!='https' or url.hostname!='platform-site.yanolja.com'
+                            or url.username or url.password or url.port not in (None,443)
+                            or not re.fullmatch(r'/domestic/order/complete/[^/]+/?',url.path)):
+                        continue
+                    for heading in driver.find_elements(By.CSS_SELECTOR,'h1'):
+                        checkpoint()
+                        if heading.is_displayed() and ' '.join((heading.text or '').split())=='예약이 완료되었어요':
+                            checkpoint()
+                            step('예약 완료 인식 · NOL 완료 페이지와 제목 확인')
+                            return True
+                except (NoSuchWindowException,StaleElementReferenceException):
+                    hint = '예약창 전환·화면 갱신 감지 · 완료 여부 재확인'
+        except NoSuchWindowException:
+            hint = '예약창 전환 중 · 남은 창 재확인'
+        except WebDriverException as error:
+            checkpoint()
+            step('브라우저 연결 확인 불가 · 완료 여부 미확인 · '+type(error).__name__)
+            return False
+        if hint!=previous_hint:
+            step(hint);previous_hint=hint
+        remaining = deadline-time.monotonic()
+        if remaining<=0:
+            checkpoint()
+            step('예약 완료 화면 확인 시간 초과 · 결제 결과 직접 확인 필요')
+            return False
+        time.sleep(min(.2,remaining))
+
+
+def _select_booking_options(driver, config, *, age_label='성인', price_keyword='일반',
+                            step=print, checkpoint=lambda: None, click=None, timeout=25):
+    """선택 화면을 단계마다 재확인한다. 구매·결제 버튼은 이 함수에서 누르지 않는다."""
+    target_date = dt.date.fromisoformat(config.date)
+    target_time = config.time_specs[0].split('~')[0].strip()
+    date_label = f'{target_date.year}년 {target_date.month}월 {target_date.day}일'
+    last_actions = {}
+    observed = {}
+    action_serial = 0
+    action_elapsed = 0.0
+    selection_started = time.monotonic()
+    pending_month = None
+    price_clicked = False
+
+    def read(key,reader):
+        if key not in observed: observed[key]=reader()
+        return observed[key]
+
+    def element_text(element):
+        return read(('text',element),lambda:element.text or '')
+
+    def attribute(element,name):
+        return read(('attribute',element,name),lambda:element.get_attribute(name))
+
+    def visible(elements):
+        return [element for element in elements if read(('visible',element),element.is_displayed)]
+
+    def enabled(element):
+        return read(('enabled',element),element.is_enabled) and attribute(element,'aria-disabled')!='true'
+
+    def xpath_text(value):
+        if "'" not in value: return "'"+value+"'"
+        if '"' not in value: return '"'+value+'"'
+        return 'concat('+',"\'",'.join("'"+part+"'" for part in value.split("'"))+')'
+
+    def act(key,element):
+        nonlocal action_serial,action_elapsed
+        checkpoint()
+        now = time.monotonic()
+        if now-last_actions.get(key,-100)<.8: return False
+        last_actions[key] = now
+        try:
+            (click or (lambda item:item.click()))(element)
+            action_serial += 1
+        finally:
+            action_elapsed += time.monotonic()-now
+            observed.clear()
+        return True
+
+    def parsed_date(text):
+        match = re.search(r'(\d{4})[.년/-]\s*(\d{1,2})[.월/-]\s*(\d{1,2})',text)
+        if not match: return None
+        try: return dt.date(*(int(part) for part in match.groups()))
+        except ValueError: return None
+
+    def age_matches(text):
+        return re.match(r'^입장권\s+'+re.escape(age_label)+r'(?:\s|\(|$)',text.strip()) is not None
+
+    def time_matches(text):
+        match = re.search(r'(?<!\d)\d{2}:\d{2}(?!\d)',text)
+        return bool(match and match.group()==target_time)
+
+    def selected_ticket():
+        return read('selected_ticket',find_selected_ticket)
+
+    def find_selected_ticket():
+        for heading in visible(driver.find_elements(By.CSS_SELECTOR,'h3')):
+            parts = [part.strip() for part in element_text(heading).split('/')]
+            if (len(parts)==4 and parsed_date(parts[0])==target_date and parts[1]==target_time
+                    and age_matches(parts[2]) and parts[3]==price_keyword):
+                return True
+        return False
+
+    def field(label):
+        return read(('field',label),lambda:find_field(label))
+
+    def find_field(label):
+        fields = visible(driver.find_elements(By.XPATH,f"//p[normalize-space(.)='{label}']/../.."))
+        if len(fields)!=1: return None,None
+        headers = visible(fields[0].find_elements(By.CSS_SELECTOR,"button[aria-haspopup='listbox']"))
+        return (fields[0],headers[0]) if len(headers)==1 else (None,None)
+
+    def retry(stage,operation):
+        started = time.monotonic()
+        deadline = started+timeout
+        click_started = action_elapsed
+        query_elapsed = waited = 0.0
+        last_change = started
+        last_hint = None
+        last_logged = started
+        attempts = 0
+        hint = '화면 대기'
+        def timing():
+            now=time.monotonic()
+            return (f'소요={now-started:.3f}초 조회={query_elapsed:.3f}초 '
+                    f'클릭={action_elapsed-click_started:.3f}초 대기={waited:.3f}초 '
+                    f'누적={now-selection_started:.3f}초')
+        while True:
+            checkpoint()
+            observed.clear()
+            attempts += 1
+            before_action = action_serial
+            before_click_time = action_elapsed
+            query_started = time.monotonic()
+            try:
+                done,hint = operation()
+            except (StaleElementReferenceException,ElementClickInterceptedException,
+                    ElementNotInteractableException) as error:
+                done,hint = False,f'화면 변경·클릭 지연 ({type(error).__name__})'
+            finally:
+                query_elapsed += max(0,time.monotonic()-query_started-(action_elapsed-before_click_time))
+            if done:
+                step(f'{stage} 확인 완료 · {hint} · 확인 {attempts}회 · {timing()}')
+                return
+            remaining = deadline-time.monotonic()
+            if remaining<=0:
+                raise BookingTestError(f'{stage} 확인 실패 · {hint} · {timeout:g}초 동안 {attempts}회 재확인 · {timing()}')
+            now=time.monotonic()
+            if hint!=last_hint or now-last_logged>=1:
+                step(f'{stage} 재확인 {attempts} · {hint} · 남은 {remaining:.1f}초')
+                last_hint,last_logged=hint,now
+            # 클릭 성공은 선택 성공이 아니다. 대기 없이 새 화면을 한 번 확인한다.
+            if action_serial!=before_action:
+                last_change=now
+                continue
+            idle=now-last_change
+            delay=.05 if idle<.5 else .15 if idle<2 else .3
+            wait_started=time.monotonic()
+            time.sleep(min(delay,remaining))
+            waited += time.monotonic()-wait_started
+
+    def ensure_panel():
+        if selected_ticket(): return True,'기존 대상 티켓 확인 · 수량 유지'
+        if field('이용 날짜')[1] is not None: return True,'옵션 선택 화면 열림'
+        buttons = visible(driver.find_elements(By.XPATH,
+            "//button[normalize-space(.)='옵션 선택하기' or normalize-space(.)='옵션 변경하기']"))
+        buttons = [button for button in buttons if enabled(button)]
+        if buttons: act('panel',buttons[-1])
+        return False,'옵션 선택 화면을 여는 중' if buttons else '옵션 선택하기 버튼 대기'
+
+    def ensure_date():
+        nonlocal pending_month
+        if selected_ticket(): return True,'기존 대상 티켓의 날짜 확인 · 수량 유지'
+        area,header = field('이용 날짜')
+        if header is None:
+            ensure_panel()
+            return False,'이용 날짜 영역 대기'
+        calendars = visible(area.find_elements(By.CSS_SELECTOR,'.leisure-calendar'))
+        if parsed_date(element_text(header))==target_date and not calendars and attribute(header,'aria-expanded')!='true':
+            return True,config.date
+        if not calendars:
+            if attribute(header,'aria-expanded')!='true' and enabled(header): act('date-open',header)
+            return False,'달력 열림·로딩 대기'
+        if len(calendars)!=1: return False,'달력 영역이 여러 개여서 재확인 중'
+        calendar = calendars[0]
+        target_tiles = visible(calendar.find_elements(By.XPATH,
+            ".//button[contains(concat(' ',normalize-space(@class),' '),' react-calendar__tile ')]"
+            f"[.//abbr[@aria-label={xpath_text(date_label)}]]"))
+        if len(target_tiles)>1: return False,f'{config.date} 날짜 셀이 여러 개여서 재확인 중'
+        if target_tiles:
+            tile=target_tiles[0]
+            if not enabled(tile): return False,f'{config.date} 날짜 비활성·선택 불가'
+            act('date-cell',tile)
+            return False,f'{config.date} 날짜 셀 클릭 후 선택값 확인 대기'
+        dates = [value for label in calendar.find_elements(By.CSS_SELECTOR,'abbr[aria-label]')
+                 if (value:=parsed_date(attribute(label,'aria-label') or ''))]
+        if not dates: return False,'달력의 연·월·일 로딩 대기'
+        months = [(value.year,value.month) for value in dates]
+        month = max(set(months),key=months.count)
+        if pending_month and month==pending_month[0] and time.monotonic()-pending_month[1]<1.6:
+            return False,'달력 월 이동 결과 대기'
+        target_month = (target_date.year,target_date.month)
+        if month==target_month: return False,f'{config.date} 날짜 셀 미발견'
+        direction = '다음 날짜로 이동' if month<target_month else '이전 달로 이동'
+        buttons = visible(calendar.find_elements(By.CSS_SELECTOR,f"button[aria-label='{direction}']"))
+        if len(buttons)!=1 or not enabled(buttons[0]): return False,f'{direction} 비활성·이동 불가'
+        if act('month',buttons[0]): pending_month=(month,time.monotonic())
+        return False,f'달력 월 이동 · {month[0]}.{month[1]:02d} → {target_date:%Y.%m}'
+
+    def ensure_choice(label,prefix,matches,previous,*,final=False):
+        nonlocal price_clicked
+        # 할인 선택은 티켓을 추가하고 입력칸을 비운다. 추가된 행을 먼저 확인한다.
+        if selected_ticket(): return True,f'{config.date} / {target_time} / {age_label} / {price_keyword}'
+        if final and price_clicked: return False,'할인 클릭 후 티켓 추가 확인 대기 · 중복 추가 방지'
+        done,hint = previous()
+        if not done: return False,hint
+        area,header = field(label)
+        if header is None: return False,f'{label} 영역 대기'
+        expanded = attribute(header,'aria-expanded')=='true'
+        header_text = element_text(header).strip()
+        if not final and matches(header_text) and not expanded:
+            return True,header_text
+        if not enabled(header): return False,f'{label} 선택 버튼 비활성 · 이전 단계 확인 중'
+        if not expanded:
+            act(label+'-open',header)
+            return False,f'{label} 목록 닫힘 → 다시 열기'
+        targets = area.find_elements(By.XPATH,
+            f".//button[@role='option'][starts-with(normalize-space(.), {xpath_text(prefix)})]")
+        options = visible(targets)
+        candidates = [option for option in options if matches(element_text(option).strip())]
+        counts = f'목표 후보 {len(targets)}개 / 표시 {len(options)}개 / 대상 {len(candidates)}개'
+        available = [option for option in candidates if enabled(option) and not any(
+            word in element_text(option).upper() for word in ('품절','매진','마감','SOLD'))]
+        if len(available)==1:
+            if act(label+'-select',available[0]) and final: price_clicked=True
+            return False,f'{label} 클릭 후 선택값 확인 대기 · {counts}'
+        total=len(area.find_elements(By.CSS_SELECTOR,"button[role='option']"))
+        counts=f'전체 {total}개 / '+counts
+        if candidates and not available: return False,f'{label} 대상 품절·마감·비활성 · {counts}'
+        if len(available)>1: return False,f'{label} 대상이 여러 개여서 재확인 중 · {counts}'
+        return False,f'{label} 대상 미발견·목록 로딩 대기 · {counts}'
+
+    retry('옵션 화면',ensure_panel)
+    retry('날짜 선택',ensure_date)
+    ensure_time = lambda:ensure_choice('이용 시간',target_time,time_matches,ensure_date)
+    ensure_age = lambda:ensure_choice('이용자','입장권 '+age_label,age_matches,ensure_time)
+    retry('시간 선택',ensure_time)
+    retry('권종 선택',ensure_age)
+    retry('요금 선택',lambda:ensure_choice('이용자 할인',price_keyword,
+        lambda text:re.fullmatch(re.escape(price_keyword)+r'(?:\s+[\d,]+원)?',text.strip()) is not None,
+        ensure_age,final=True))
+
+
 def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_label: str = "성인",
                      price_keyword: str = "일반", stop_before_pay: bool = True,
-                     should_stop: Callable[[], bool] | None = None) -> bool:
-    """브라우저에 선택된 날짜에서 첫 시각·한 권종을 시험하고 결제 직전에 끝낸다.
-
-    날짜·수량은 사용자가 브라우저에서 먼저 설정한다. 최종 결제는 지원하지 않는다.
-    """
+                     should_stop: Callable[[], bool] | None = None) -> bool | BookingResult:
+    """설정 날짜의 첫 시각·한 권종을 확인한 뒤 기존 구매·결제 흐름을 진행한다."""
     # stop_before_pay=False 이면 실제 결제까지 진행 (감시 자동 예약용)
     if not stop_before_pay:
         pass  # 실제 결제 허용
 
     def checkpoint():
         if should_stop is not None and should_stop():
-            raise BookingTestError('프로그램 종료 요청으로 예약 테스트를 중지했습니다')
+            raise BookingCancelled('중지 요청으로 브라우저 테스트를 중지했습니다')
+
+    def wait_for(seconds, condition):
+        def checked(drv):
+            checkpoint()
+            value = condition(drv)
+            checkpoint()
+            return value
+        return WebDriverWait(driver,seconds,poll_frequency=.1).until(checked)
+
+    def pause(seconds):
+        remaining = seconds
+        while remaining>0:
+            checkpoint()
+            interval = min(.1,remaining)
+            time.sleep(interval)
+            remaining -= interval
+        checkpoint()
 
     def step(message):
         checkpoint()
@@ -502,126 +810,31 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
     checkpoint()
     config.validate()
     if config.mode!='entry': raise BookingTestError('예약 테스트는 입장권 모드만 지원합니다')
-    wait=WebDriverWait(driver,15)
     stage='옵션 선택하기'
+    booking_started=time.monotonic()
     target_time=config.time_specs[0].split('~')[0].strip()
     try:
         step(f'대상 날짜 {config.date} · 첫 시각 {target_time} · 권종 {age_label}')
-        # 달력이 나오려면 "옵션 선택하기" 버튼을 먼저 눌러야 함
-        step('옵션 선택하기 버튼 대기')
-        try:
-            opt_btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable(
-                (By.XPATH, '//button[.//span[contains(text(), "옵션 선택하기")] or contains(., "옵션 선택하기")]')
-            ))
-            click(opt_btn)
-            step('옵션 선택하기 클릭 완료 · 달력 대기')
-            time.sleep(0.6)
-        except TimeoutException:
-            step('옵션 선택하기 버튼을 찾지 못했습니다. 이미 열려 있다고 가정하고 진행합니다.')
+        stage='옵션·날짜·회차 선택'
+        _select_booking_options(driver,config,age_label=age_label,price_keyword=price_keyword,
+                                step=step,checkpoint=checkpoint)
 
-        stage='날짜 선택'
-        day = config.date.split('-')[-1].lstrip('0') or '0'
-        date_clicked = False
-        for attempt in range(1, 6):
-            try:
-                candidates = driver.find_elements(By.XPATH,
-                    f'//button[normalize-space(.)="{day}" or contains(@aria-label, "{day}") or contains(., "{day}")]')
-                for btn in candidates:
-                    txt = (btn.text or '').strip()
-                    al = (btn.get_attribute('aria-label') or '')
-                    if txt == day or day in al or day in (btn.text or ''):
-                        if btn.is_enabled() and btn.get_attribute('aria-disabled') != 'true':
-                            click(btn)
-                            date_clicked = True
-                            step(f'날짜 선택 완료: {config.date} (시도 {attempt}, 텍스트={txt})')
-                            time.sleep(0.7)
-                            break
-                if date_clicked:
-                    break
-            except Exception:
-                pass
-            step(f'날짜 시도 {attempt}/5 · {day}일 미발견 · 0.4초 후 재시도')
-            time.sleep(0.4)
-
-        if not date_clicked:
-            step('날짜 버튼을 찾지 못했습니다. 이미 선택된 상태로 진행합니다.')
-
-        stage='시간 선택'
-        step(f'시간 버튼 대기 중 · 대상 {target_time}')
-        clicked = False
-        max_try = 8
-        for attempt in range(1, max_try + 1):
-            buttons = driver.find_elements(By.CSS_SELECTOR, 'button[role="option"]')
-            found = []
-            for button in buttons:
-                try:
-                    label = (button.get_attribute('aria-label') or '').strip()
-                    text = (button.text or '').strip()
-                    inners = [p.text.strip() for p in button.find_elements(By.TAG_NAME, 'p') if p.text and p.text.strip()]
-                    combined = ' '.join([label, text] + inners)
-                    if target_time in combined:
-                        found.append(combined[:50])
-                    if target_time not in combined:
-                        continue
-                    if any(x in combined for x in ('품절', '매진', '대기', 'SOLD')):
-                        continue
-                    if button.get_attribute('aria-disabled') == 'true' or not button.is_enabled():
-                        continue
-                    click(button)
-                    clicked = True
-                    step(f'시간 선택 완료: {target_time} (시도 {attempt})')
-                    break
-                except Exception:
-                    continue
-            if clicked:
-                break
-            step(f'시도 {attempt}/{max_try} · {target_time} 미발견 (후보 {len(found)}개) · 0.4초 후 재시도')
-            time.sleep(0.4)
-
-        if not clicked:
-            raise BookingTestError(f'구매 가능한 {target_time} 시간 버튼을 찾지 못했습니다')
-        time.sleep(0.15)
-
-        stage='권종 선택';step(f'권종 선택: 입장권 {age_label}')
-        options=wait.until(EC.presence_of_all_elements_located(
-            (By.XPATH,f'//button[contains(., "입장권 {age_label}") or contains(., "{age_label}")]')))
-        for option in options:
-            if age_label in (option.text or '') and option.is_enabled():
-                click(option);break
-        else: raise BookingTestError(f'권종 {age_label} 버튼을 찾지 못했습니다')
-        time.sleep(0.12)
-
-        stage='요금 선택';step('요금 옵션 선택: '+price_keyword)
-        price_clicked = False
-        for attempt in range(1, 6):
-            try:
-                prices = driver.find_elements(By.XPATH, f'//button[contains(., "{price_keyword}")]')
-                for button in prices:
-                    text = button.text or ''
-                    if price_keyword in text and ('원' in text or '일반' in text) and button.is_enabled():
-                        click(button)
-                        price_clicked = True
-                        step(f'요금 선택 완료 (시도 {attempt})')
-                        break
-                if price_clicked:
-                    break
-            except StaleElementReferenceException:
-                pass
-            step(f'요금 시도 {attempt}/5 · 미발견 · 0.35초 후 재시도')
-            time.sleep(0.35)
-        if not price_clicked:
-            raise BookingTestError(f'{price_keyword} 요금 옵션을 찾지 못했습니다')
-        time.sleep(0.15)
-
-        stage='구매 화면 이동';step('구매하기 버튼 클릭')
-        buy=wait.until(EC.element_to_be_clickable((By.XPATH,'//button[contains(., "구매하기")]')))
-        click(buy);time.sleep(0.45)
+        stage='구매 화면 이동';step('구매하기 버튼 대기')
+        buy_started=time.monotonic()
+        buy=wait_for(15,EC.element_to_be_clickable((By.XPATH,'//button[contains(., "구매하기")]')))
+        buy_ready=time.monotonic()
+        click(buy)
+        buy_finished=time.monotonic()
+        step(f'구매하기 클릭 완료 · 소요={buy_finished-buy_started:.3f}초 '
+             f'버튼대기={buy_ready-buy_started:.3f}초 클릭·화면전환={buy_finished-buy_ready:.3f}초 '
+             f'누적={buy_finished-booking_started:.3f}초')
+        pause(0.45)
 
         stage='결제수단 선택';step('결제수단: NOL 머니 선택')
         money_clicked = False
         for attempt in range(1, 6):
             try:
-                money = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH,
+                money = wait_for(6,EC.element_to_be_clickable((By.XPATH,
                     '//button[contains(., "NOL 머니")] | //label[contains(., "NOL 머니")] | //span[contains(text(), "NOL 머니")] | //div[contains(., "NOL 머니")]')))
                 click(money)
                 money_clicked = True
@@ -629,13 +842,13 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
                 break
             except StaleElementReferenceException:
                 step(f'NOL 머니 시도 {attempt}/5 · Stale · 재시도')
-                time.sleep(0.3)
+                pause(0.3)
             except TimeoutException:
                 step(f'NOL 머니 시도 {attempt}/5 · 미발견 · 재시도')
-                time.sleep(0.4)
+                pause(0.4)
         if not money_clicked:
             raise BookingTestError('NOL 머니 결제수단을 선택하지 못했습니다')
-        time.sleep(0.2)
+        pause(0.2)
 
         stage='전체 동의';step('전체 동의 항목 확인')
         xpath = (
@@ -644,7 +857,7 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             "//input[@type='checkbox']"
         )
         try:
-            checkbox = WebDriverWait(driver, 10).until(
+            checkbox = wait_for(10,
                 EC.element_to_be_clickable((By.XPATH, xpath))
             )
         except TimeoutException:
@@ -654,21 +867,23 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             click(checkbox)
         # 실제 체크 상태 확인
         try:
-            WebDriverWait(driver, 5).until(
+            wait_for(5,
                 EC.element_located_to_be_selected((By.XPATH, xpath))
             )
         except TimeoutException:
             raise BookingTestError('전체 동의 체크 후에도 선택 상태가 되지 않았습니다')
         step('전체 동의 체크 완료')
-        time.sleep(0.08)
+        pause(0.08)
         # 확인
         if not checkbox.is_selected():
             try:
                 click(checkbox)
+            except BookingCancelled:
+                raise
             except Exception:
                 pass
         step('전체 동의 체크 완료 (JS 강제)')
-        time.sleep(0.1)
+        pause(0.1)
 
         stage='최종 결제 버튼 클릭'
         step('결제하기 버튼 대기 및 클릭')
@@ -691,7 +906,7 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             return False
 
         try:
-            pay_button = WebDriverWait(driver, 12).until(visible_pay_button)
+            pay_button = wait_for(12,visible_pay_button)
         except TimeoutException:
             raise BookingTestError('표시된 활성 결제 버튼을 찾지 못했습니다')
         btn_text = (pay_button.text or '').strip().replace('\n', ' ')
@@ -703,25 +918,30 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
         new_window = None
         deadline = time.time() + 12
         while time.time() < deadline:
+            checkpoint()
             handles = set(driver.window_handles)
             new_ones = handles - original_handles
             if new_ones:
                 for h in new_ones:
                     try:
+                        checkpoint()
                         driver.switch_to.window(h)
                         url = driver.current_url or ''
                         step(f'새 창 발견: {url[:80]}')
                         if 'nol-money' in url or 'yanolja' in url:
                             new_window = h
                             break
+                    except BookingCancelled:
+                        raise
                     except Exception:
                         continue
                 if new_window:
                     break
-            time.sleep(0.08)
+            pause(0.08)
 
         if not new_window:
             step('새 결제 창을 찾지 못했습니다. 현재 창에서 키패드 탐색 시도')
+            checkpoint()
             driver.switch_to.window(original_window)
         else:
             step('결제 창으로 전환 완료')
@@ -729,7 +949,7 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
         # 키패드 대기
         step('PIN 키패드 대기 중')
         try:
-            WebDriverWait(driver, 15).until(
+            wait_for(15,
                 EC.presence_of_element_located((By.CSS_SELECTOR, '#mtk_pinCodeInput'))
             )
             step('PIN 키패드(#mtk_pinCodeInput) 감지됨')
@@ -737,12 +957,16 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             step('PIN 키패드 DOM을 찾지 못했습니다')
             # 원래 창으로 복귀
             try:
+                checkpoint()
                 driver.switch_to.window(original_window)
+            except BookingCancelled:
+                raise
             except Exception:
                 pass
+            checkpoint()
             return True
 
-        time.sleep(0.08)
+        pause(0.08)
         # 숫자 스캔
         digit_map = {}
         buttons = driver.find_elements(By.CSS_SELECTOR, '#mtk_pinCodeInput a[role="button"][aria-label]')
@@ -754,6 +978,8 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
                     digit_map[label] = btn
                     r = btn.rect
                     step(f'  숫자 {label} 위치 x={int(r.get("x",0))} y={int(r.get("y",0))}')
+            except BookingCancelled:
+                raise
             except Exception:
                 continue
 
@@ -765,6 +991,8 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             try:
                 r = btn.rect
                 items.append((label, r.get('y', 0), r.get('x', 0)))
+            except BookingCancelled:
+                raise
             except Exception:
                 continue
         # y(행) → x(열) 순 정렬
@@ -802,6 +1030,7 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             step('  ' + ' / '.join(parts))
         step('=== 격자 인식 종료 ===')
 
+        checkpoint()
         # PIN 읽기: settings.json 우선
         import os, json
         pin = ''
@@ -818,6 +1047,8 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
                     if pin:
                         step('settings.json에서 NOL_MON_PIN 읽음')
                         break
+        except BookingCancelled:
+            raise
         except Exception as e:
             step(f'settings.json 읽기 실패: {type(e).__name__}')
 
@@ -828,6 +1059,7 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             else:
                 step('PIN 미설정 · 입력 생략')
                 step('키패드 창에 그대로 유지하고 종료')
+                checkpoint()
                 return True
 
         step('PIN 입력 시작')
@@ -838,17 +1070,20 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
             try:
                 click(digit_map[ch])
                 step(f'  입력 진행 {i}/6')
-                time.sleep(0.14)
+                pause(0.14)
+            except BookingCancelled:
+                raise
             except Exception as e:
                 step(f'  {i}/6 클릭 실패: {type(e).__name__}')
 
         step('PIN 6자리 클릭 완료')
-        time.sleep(0.3)
+        pause(0.3)
 
         # 확인 버튼 클릭 (실제 결제 진행)
+        stage='결제 확인 버튼'
         step('확인 버튼 대기')
         try:
-            confirm = WebDriverWait(driver, 8).until(
+            confirm = wait_for(8,
                 EC.element_to_be_clickable((By.CSS_SELECTOR, '#mtk_pinCodeInput a[aria-label="확인"], a[aria-label="확인"]'))
             )
             click(confirm)
@@ -856,36 +1091,19 @@ def run_test_booking(driver, config: WatchConfig, *, log: LogFn = print, age_lab
         except TimeoutException:
             step('확인 버튼을 찾지 못했습니다')
             step('키패드 창에 그대로 유지하고 종료')
+            checkpoint()
             return True
 
-        time.sleep(1.2)
+        stage='예약 완료 확인'
+        pause(1.2)
         # 예약 완료 화면 확인
         step('예약 완료 화면 확인 중')
-        success = False
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, '//*[contains(text(), "예약이 완료되었어요") or contains(text(), "예약이 완료")]'))
-            )
-            success = True
-            step('예약 완료 인식: 예약이 완료되었어요')
-        except TimeoutException:
-            step('완료 문구를 찾지 못함 · 화면 텍스트 확인')
-
-        # 주문번호 등 추가 정보 추출 시도
-        try:
-            body_text = driver.find_element(By.TAG_NAME, 'body').text
-            for line in body_text.splitlines():
-                line = line.strip()
-                if any(k in line for k in ('주문번호', 'Y26', '통합 주문', '결제 금액', 'NOL 머니')):
-                    step(f'  결과: {line[:80]}')
-        except Exception:
-            pass
-
-        if success:
-            step('테스트 결제 성공 · 예약 완료')
-        else:
-            step('테스트 결제 플로우 종료 (완료 화면 미확인)')
-        return True
+        success = _wait_booking_confirmation(driver,original_window,new_window,
+                                             step=step,checkpoint=checkpoint)
+        result = BookingResult('confirmed' if success else 'unconfirmed')
+        step(booking_result_message(result))
+        checkpoint()
+        return result
     except BookingTestError:
         raise
     except TimeoutException:
@@ -1018,7 +1236,7 @@ class OperationsUI:
         test_pay_row=ttk.Frame(scenario.content,style='Card.TFrame');test_pay_row.pack(fill='x',pady=(12,0))
         self.test_pay_button=ttk.Button(test_pay_row,text='테스트 결제 (브라우저)',style='Accent.TButton',command=self.start_test_booking)
         self.test_pay_button.pack(side='left',padx=(0,8))
-        self.test_pay_status=tk.StringVar(value='첫 시각·첫 권종만 테스트 · 날짜·수량은 브라우저에서 먼저 선택 · 최종 결제 미실행')
+        self.test_pay_status=tk.StringVar(value='GUI 날짜·첫 시각·첫 권종 선택 · 수량은 브라우저에서 확인')
         ttk.Label(test_pay_row,textvariable=self.test_pay_status,style='Muted.Card.TLabel',wraplength=700).pack(side='left')
         self.admin_widgets.append(self.test_pay_button)
         preview=card(body);preview.pack(fill='x')
@@ -1068,11 +1286,11 @@ class OperationsUI:
         self.run_button.configure(state='normal' if self.admin_enabled and not self.rehearsing and not working else 'disabled')
         for widget in (self.next_button,self.stop_button): widget.configure(state='normal' if self.rehearsing else 'disabled')
 
-    def start_test_booking(self):
+    def start_test_booking(self, *, from_home=False):
         """첫 시각·첫 권종의 브라우저 동선을 공유 작업 큐에서 시험한다."""
         from storage import sanitize
         app=self.app
-        if not self.admin_enabled:
+        if not from_home and not self.admin_enabled:
             app._log('관리 모드를 먼저 열어주세요');return
         if app.closed or app.busy or app.session_pending or app.runner.running or self.rehearsing:
             app._log('다른 작업이 실행 중입니다');return
@@ -1082,17 +1300,41 @@ class OperationsUI:
         except ValueError as error:
             app._log('예약 테스트 설정 오류 · '+sanitize(error))
             self.test_pay_status.set('설정 확인 필요');return
+        self._begin_booking(config)
+
+    def start_auto_booking(self, snapshot=None):
+        """감시의 예약 요청도 수동 테스트와 같은 중지·완료 절차로 실행한다."""
+        from storage import sanitize
+        app=self.app
+        if (app.closed or app.busy or app.session_pending or app.test_booking_hold or self.rehearsing
+                or not app.runner.running or app.runner.stop_event.is_set()): return
+        try:
+            config=snapshot.config.validate() if snapshot is not None else app.read_config()
+            if config.mode!='entry':
+                app._log('자동 예약은 입장권 모드만 지원합니다');return
+        except ValueError as error:
+            app._log('자동 예약 설정 오류 · '+sanitize(error));return
+        self._begin_booking(config,automatic=True)
+
+    def _begin_booking(self,config,*,automatic=False):
+        app=self.app
         age_label=AGE_NAMES[config.selected_ages[0]]
-        self.test_pay_status.set('브라우저 테스트 진행 중 · 최종 결제 미실행')
+        label='자동 예약' if automatic else '브라우저 테스트'
+        self.test_pay_status.set(label+' 진행 중 · 홈의 중지 버튼으로 중단')
+        app.status.set(label+' 진행 중 · 중지 버튼으로 중단할 수 있습니다')
+        app.booking_stop.clear()
+        app.booking_active = True
         app.test_booking_hold = True
-        app._log(f'[TEST-BOOKING] 시작 · 첫 시각 {config.time_specs[0].split("~")[0]} · 권종 {age_label} · 날짜·수량은 브라우저 선택값')
+        prefix='AUTO-BOOKING' if automatic else 'TEST-BOOKING'
+        app._log(f'[{prefix}] 시작 · 첫 시각 {config.time_specs[0].split("~")[0]} · 권종 {age_label} · 날짜 {config.date} · 수량은 브라우저 선택값')
         app._lock_conditions(True)
 
         def job():
             browser=app.browser
             try:
                 with app.client.lock, browser.lock:
-                    if app.closed: raise BookingTestError('프로그램 종료 요청으로 예약 테스트를 중지했습니다')
+                    if app.closed or app.booking_stop.is_set():
+                        raise BookingCancelled('중지 요청으로 브라우저 테스트를 중지했습니다')
                     if browser.driver is None:
                         raise BookingTestError('브라우저가 연결되지 않았습니다. 먼저 로그인 브라우저를 열어주세요')
                     browser._select()
@@ -1101,66 +1343,14 @@ class OperationsUI:
                     if actual!=expected:
                         raise BookingTestError('대상 상품 페이지에서 날짜와 수량을 먼저 선택하세요')
                     browser.headers={};browser.ready_url=None
-                    return run_test_booking(browser.driver,config,age_label=age_label,stop_before_pay=True,
-                        should_stop=lambda:app.closed,
+                    return run_test_booking(browser.driver,config,age_label=age_label,stop_before_pay=not automatic,
+                        should_stop=lambda:app.closed or app.booking_stop.is_set(),
                         log=lambda message:app._emit({'kind':'log','message':message}))
             except BookingTestError: raise
             except Exception as error:
                 raise BookingTestError('브라우저 테스트 실패 · '+type(error).__name__) from None
 
         app._submit(job,'test_pay_done')
-        # 테스트 끝난 뒤 30초간 keepalive가 페이지를 건드리지 못하게 함
-        app.root.after(30000, lambda: setattr(app, 'test_booking_hold', False))
-    def _start_auto_booking(self, snapshot=None):
-        """감시 중 가용 발견 시 자동으로 예약(결제) 시도."""
-        if self.closed or self.busy or self.runner.running is False:
-            return
-        try:
-            config = self.read_config()
-            if config.mode != 'entry':
-                self._log('자동 예약은 입장권 모드만 지원'); return
-        except Exception as e:
-            self._log('자동 예약 설정 오류 · ' + str(e)); return
-
-        age_label = AGE_NAMES.get(config.selected_ages[0], '성인') if config.selected_ages else '성인'
-        self.test_booking_hold = True
-        self._log(f'[AUTO-BOOKING] 가용 발견 · {age_label} 예약 시도')
-        self._lock_conditions(True)
-
-        def job():
-            browser = self.browser
-            try:
-                with self.client.lock, browser.lock:
-                    if self.closed:
-                        raise BookingTestError('종료 요청')
-                    if browser.driver is None:
-                        raise BookingTestError('브라우저 미연결')
-                    browser._select()
-                    return run_test_booking(
-                        browser.driver, config,
-                        age_label=age_label,
-                        stop_before_pay=False,  # 실제 결제까지
-                        should_stop=lambda: self.closed,
-                        log=lambda m: self._emit({'kind': 'log', 'message': m})
-                    )
-            except BookingTestError as e:
-                self._emit({'kind': 'log', 'message': f'[AUTO-BOOKING] 실패 · {e}'})
-                return False
-            except Exception as e:
-                self._emit({'kind': 'log', 'message': f'[AUTO-BOOKING] 오류 · {type(e).__name__}'})
-                return False
-            finally:
-                # 결제 후 상품 페이지로 복귀 시도
-                try:
-                    if browser.driver:
-                        browser.driver.get(config.url)
-                        self._emit({'kind': 'log', 'message': '[AUTO-BOOKING] 상품 페이지 복귀'})
-                except Exception:
-                    pass
-                self.test_booking_hold = False
-                self._emit({'kind': 'log', 'message': '[AUTO-BOOKING] 완료 · 감시 계속'})
-
-        self._submit(job, 'auto_booking_done')
 
 
 
@@ -1176,7 +1366,7 @@ class OperationsUI:
         for index,step in enumerate(self.steps): self.flow.insert('','end',iid=str(index),values=(step,'확인 중' if index==0 else '대기'))
         self.index=0;self.rehearsing=True
         self.preview_status.set('GUI 점검 중 · '+self.vars['kind'].get()+' / '+self.vars['quantity'].get()+' / '+self.vars['stage'].get())
-        self.app._log('관리모드 GUI 점검 시작 · 브라우저 동작 없음');self._buttons()
+        self.app._log('관리모드 GUI 점검 시작 · 브라우저 동작 없음');self.app._buttons()
 
     def next_step(self):
         if not self.rehearsing: return
@@ -1188,13 +1378,13 @@ class OperationsUI:
         else:
             self.flow.item(str(self.index),values=(self.steps[self.index],'확인 중'));self.flow.see(str(self.index))
             self.preview_status.set('GUI 점검 중 · '+self.steps[self.index])
-        self._buttons()
+        self.app._buttons()
 
     def stop_preview(self):
         if not self.rehearsing: return
         self.flow.item(str(self.index),values=(self.steps[self.index],'중지'))
         self.rehearsing=False;self.preview_status.set('GUI 테스트 종료 · 외부 주문·결제 상태와 무관합니다.')
-        self.app._log('관리모드 GUI 점검 종료');self._buttons()
+        self.app._log('관리모드 GUI 점검 종료');self.app._buttons()
 
     def open_logs(self):
         try: os.startfile(str(self.app.base/'logs'))
@@ -1235,6 +1425,9 @@ class App:
         self.busy=False
         self.session_pending=False
         self.test_booking_hold=False
+        self.booking_active=False
+        self.booking_stop=threading.Event()
+        self._monitor_finishing=False
         self.syncing=False
         self.catalog_stop=threading.Event()
         self.mutating=False
@@ -1565,6 +1758,8 @@ class App:
         self.busy=True; self._buttons()
         def work():
             try: event={'kind':kind,'value':job(),'ticket':ticket}
+            except BookingCancelled as error:
+                event={'kind':'test_pay_cancelled','operation':kind,'message':sanitize(error),'ticket':ticket}
             except Exception as error: event={'kind':'job_error','operation':kind,'message':sanitize(error),'ticket':ticket,'auth':isinstance(error,AuthLost)}
             self._emit(event)
         self._background(work)
@@ -1702,6 +1897,7 @@ class App:
             self._problem(error); return None
 
     def _start(self):
+        self._show_page('explore')
         if self.busy or self.runner.running: return
         try:
             notifier=TelegramNotifier(self.vars['token'].get(),self.vars['chat'].get()).validate()
@@ -1712,14 +1908,27 @@ class App:
         self.status.set('감시 준비 중…')
         self.detail.set(date_label(config.date)+' | '+', '.join(config.time_specs)+' | '+count_label(config.counts))
         self.runner.start(config,notifier)
+        self._monitor_finishing=False
         self._lock_conditions(True); self._buttons()
 
+    def _start_browser_test(self):
+        self.operations.start_test_booking(from_home=True)
+
     def _stop(self):
-        if self.syncing:
-            self.catalog_stop.set();self.status.set('목록 확보 중지 요청 · 이미 읽은 목록은 저장됩니다')
-            self.stop_button.configure(state='disabled');return
-        self.runner.stop(); self.status.set('중지 요청 · 진행 중인 조회가 끝나면 종료됩니다')
-        self.stop_button.configure(state='disabled')
+        self.runner.stop()
+        if self.syncing: self.catalog_stop.set()
+        if self.operations.rehearsing: self.operations.stop_preview()
+        if self.booking_active:
+            if not self.booking_stop.is_set():
+                self.booking_stop.set()
+                self._log('브라우저 테스트 중지 요청 · 다음 동작 전에 중단합니다',event='BOOKING_TEST_STOP_REQUESTED')
+            message='브라우저 테스트 중지 요청 · 진행 중인 동작이 끝나면 중지됩니다'
+            self.status.set(message);self.operations.test_pay_status.set(message)
+        elif self.syncing:
+            self.status.set('목록 확보 중지 요청 · 이미 읽은 목록은 저장됩니다')
+        else:
+            self.status.set('중지 요청 · 진행 중인 조회가 끝나면 종료됩니다' if self.runner.running else '작업 중지')
+        self._buttons()
 
     def _lock_conditions(self,locked):
         for widget in self.condition_widgets:
@@ -1731,7 +1940,10 @@ class App:
         running=self.runner.running
         state='disabled' if self.busy or running else 'normal'
         for widget in (self.catalog_button,self.login_button,self.session_button,self.connect_button,self.refresh_button,self.start_button,self.test_button,self.save_button): widget.configure(state=state)
-        can_stop=running and not self.runner.stop_event.is_set() or self.syncing and not self.catalog_stop.is_set()
+        rehearsing=hasattr(self,'operations') and self.operations.rehearsing
+        self.browser_test_button.configure(state='disabled' if self.busy or running or rehearsing else 'normal')
+        can_stop=(running and not self.runner.stop_event.is_set() or self.syncing and not self.catalog_stop.is_set()
+                  or self.booking_active and not self.booking_stop.is_set() or rehearsing)
         self.stop_button.configure(state='normal' if can_stop else 'disabled')
         if hasattr(self,'operations'): self.operations._buttons()
 
@@ -1756,26 +1968,44 @@ class App:
     def _poll(self):
         if self.closed: return
         self.root.after_cancel(self.poll_id)
-        while True:
-            try: event=self.events.get_nowait()
-            except queue.Empty: break
-            self._event_persisted=event.get('_persisted',False)
-            try: self._handle_event(event)
-            finally: self._event_persisted=False
-        self.poll_id=self.root.after(100,self._poll)
+        try:
+            while True:
+                try: event=self.events.get_nowait()
+                except queue.Empty: break
+                self._event_persisted=event.get('_persisted',False)
+                try: self._handle_event(event)
+                except Exception as error:
+                    self._callback_exception(type(error),error,error.__traceback__)
+                    self._log(f"화면 이벤트 처리 오류 · {event.get('kind','unknown')} · {type(error).__name__} · 다음 결과 수신 계속",
+                              persist=True,level=logging.ERROR,event='GUI_EVENT_FAILED')
+                finally: self._event_persisted=False
+            # finished 이벤트는 감시 스레드가 반환하기 직전에 도착할 수 있다.
+            if self._monitor_finishing and not self.runner.running:
+                self._monitor_finishing=False
+                self._lock_conditions(self.busy or self.booking_active)
+                if not self.busy and not self.booking_active and self.status.get()=='감시 종료 · 작업 정리 중':
+                    self.status.set('감시 종료 · 다시 시작할 수 있습니다')
+                self._buttons()
+        finally:
+            if not self.closed: self.poll_id=self.root.after(100,self._poll)
 
     def _handle_event(self,event):
+        if 'monitor_stop' in event and event['monitor_stop'] is not self.runner.stop_event: return
         kind=event['kind']
         if kind=='session_maintenance':
             self._show_session_maintenance(event)
-        elif kind in ('loaded','tested','login_opened','session_saved','catalog_done','job_error','test_pay_done'):
+        elif kind in ('loaded','tested','login_opened','session_saved','catalog_done','job_error','test_pay_done','test_pay_cancelled'):
             self.busy=False
-            booking=kind=='test_pay_done' or event.get('operation')=='test_pay_done'
+            booking=kind in ('test_pay_done','test_pay_cancelled') or event.get('operation')=='test_pay_done'
             if booking:
-                self._lock_conditions(False)
-                message=('테스트 완료 · 최종 결제 미실행' if kind=='test_pay_done' else
+                self.booking_active=False
+                self.test_booking_hold=False
+                self._lock_conditions(self.runner.running)
+                message=('브라우저 테스트 중지 완료' if kind=='test_pay_cancelled' else
+                         booking_result_message(event.get('value')) if kind=='test_pay_done' else
                          '테스트 실패 · '+event['message'])
                 self.operations.test_pay_status.set(message)
+                self.status.set(message)
             if event.get('auth'): self.session_status.set('로그인 만료 · 전용 Edge에서 다시 로그인하세요')
             if kind in ('catalog_done','job_error'): self.syncing=False
             ticket=event.get('ticket')
@@ -1784,7 +2014,7 @@ class App:
                 self.status.set('조건 변경 · 회차 새로고침 필요')
             elif kind=='loaded': self._show_loaded(event['value'])
             elif kind=='tested': self._log('텔레그램 테스트 알림 전송 완료')
-            elif kind=='test_pay_done': self._log('브라우저 예약 테스트 완료 · 최종 결제 미실행')
+            elif kind in ('test_pay_done','test_pay_cancelled'): self._log(message)
             elif kind=='login_opened':
                 if event['value']:
                     self.status.set('로그인 연결 완료 · 목록 읽기 또는 감시 시작이 가능합니다')
@@ -1810,14 +2040,18 @@ class App:
             self._update_product_stats();self.status.set(event['message']);self._log(event['message'])
         elif kind=='snapshot': self._show_snapshot(event)
         elif kind=='booking_attempt':
+            if not self.runner.running or self.runner.stop_event.is_set(): return
             self._log(event.get('message','가용 회차 발견 · 예약 시도'))
             # 가용 발견 시 실제 결제 시도 (백그라운드)
             if not self.busy and not getattr(self, 'test_booking_hold', False):
-                self._start_auto_booking(event.get('snapshot'))
+                self.operations.start_auto_booking(event.get('snapshot'))
         elif kind=='started': self._log('감시 시작 · '+date_label(event['config'].date))
         elif kind=='finished':
-            if not self.status.get().startswith('NOL') and '로그인' not in self.status.get(): self.status.set('감시 종료 · 조건을 변경할 수 있습니다')
-            self._lock_conditions(False); self._buttons(); self._log(event['message'])
+            self._monitor_finishing=self.runner.running
+            if not self.booking_active and not self.status.get().startswith('NOL') and '로그인' not in self.status.get():
+                self.status.set('감시 종료 · 작업 정리 중' if self.busy or self.runner.running else '감시 종료 · 다시 시작할 수 있습니다')
+            self._lock_conditions(self.busy or self.booking_active or self.runner.running)
+            self._buttons(); self._log(event['message'])
         elif kind in ('auth','error'):
             if kind=='auth': self.session_status.set('로그인 만료 · 전용 Edge에서 다시 로그인하세요')
             self.status.set(event['message']); self._log(event['message'])
@@ -1849,7 +2083,7 @@ class App:
         from storage import atomic_write, sanitize
         if self.closed: return
         self.logger.info('프로그램 종료 요청 · 감시/목록 작업 중지',extra={'event':'APP_CLOSING'})
-        self.closed=True; self.runner.stop();self.catalog_stop.set(); self.root.after_cancel(self.poll_id)
+        self.closed=True; self.runner.stop();self.catalog_stop.set();self.booking_stop.set(); self.root.after_cancel(self.poll_id)
         self.root.after_cancel(self.keepalive_id)
         if self.browser_open_id is not None: self.root.after_cancel(self.browser_open_id)
         self._remember()

@@ -83,7 +83,8 @@ class AuthLoggingTests(unittest.TestCase):
             original = json.dumps(cookies)
             session.cookie_file.write_text(original, encoding="utf-8")
 
-            with self.assertRaises(LoginRequired):
+            with patch.object(session, "_try_kakao_login", return_value=False), \
+                 self.assertRaises(LoginRequired):
                 session.connect(DEFAULT_URL)
 
             self.assertEqual(session.cookie_file.read_text(encoding="utf-8"), original)
